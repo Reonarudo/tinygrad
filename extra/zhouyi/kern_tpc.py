@@ -6,6 +6,7 @@ encoder produces cannot drift apart; the gate is a whole-image byte diff.
 The prologue carries the FP enable (`image.fp_enable`): without it every vector-arithmetic
 instruction (fp32 `fma` as well as `mml`/`mma`) traps to exception vector 3, which presents as a hang.
 """
+import struct
 from typing import NamedTuple
 
 from extra.zhouyi import enc as E
@@ -3845,7 +3846,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # (64 c_j + 16 c_(j+1) + 4 c_(j+2) + c_(j+3)) x 2^-24: no shift or mask, the stores are the only slot-2 ops. The mixing is
     # across the strip's COLUMN tiles, so after the k-loop C(j) -= C(j+1) / 4 (j = 0, 1, 2, in that order) leaves C(j) =
     # 64 x 2^-24 A c_j; the offset (c = w + 1) is q8's pre-pass (`sprep`, constant 64 x 2^-24) and C -= S'; the single-layout
-    # table carries s x 2^18. Exact before the scale multiply (integer lanes, power-of-two steps).
+    # table carries s x 2^18. Exact before the scale multiply (integer lanes, power-of-two steps). Rows 1-8 (rt <= 2) take the
+    # fast path TF below: the expand fused into the k-loop (codes -> B tiles in registers, no fp16 panels: `strips_tf`), C
+    # accumulated in LSRAM and scale-and-accumulate fused (acc = fp32(acc + C x s), one rounding a slice after the first); rows 9-12 and the prefill layout keep C in GSRAM with a separate multiply and add. (A duplicated
+    # scale table would save the extl / exth, but they ride in the epilogue's slot-2 gaps: the same bundle count, so the
+    # single layout -- ns x 64 B fewer a slice -- stays the only one.)
     assert scales in ("dup", "single"), scales
     SSC = scales == "single"
     assert not tern or (b8 and bscale and SSC and not q8 and not q8f and ks % 2 == 0 and kw == 4), "k_gemm_gs(tern): b8 + bscale + scales='single'"
@@ -3911,17 +3916,28 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     STG0 = LS.alloc("C staging 0", CROW, vld_tail=True); STG1 = LS.alloc("C staging 1", CROW, vld_tail=True)
     CBB = BH + (max(SCLB, 32 * TU) if tern else max(SCLB, 128) if V2 else SCLB)   # the codes + scales buffer: expand_v2's pipeline reads 128 B past the codes (a table under 128 B is padded)
     CB = LS.alloc("bscale: a slice's codes + scales", CBB, vld_tail=True) if bscale else STG1 + CROW
-    SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile)", 64 * RT, vld_tail=True) if SP else None
+    TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma")
+    SPB = (256 if TF else 64) * RT                 # TF: the k-loop's starting offsets (a register a C register) instead of S'
+    SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile; TF: the C start offsets)", SPB, vld_tail=True) if SP else None
     # rows mode, rt <= 2, block-scaled E4M3: the next slice's B (codes + scales, one DMA through DESC +128) and compact A are
     # requested while the current slice expands and computes. LSRAM: fp16 panels [0, 2 BH) | A x2 | one staging | B x2
     PF = SINGLE and RT <= 2 and b8 and bscale and timing is None
     if PF:
         LP = Lsram(f"k_gemm_gs(ks={ks}, ns={ns}, rt={RT}) prefetch")
-        LP.alloc("B panels (fp16)", ns * ks * 128, vld_tail=True)
+        if not TF: LP.alloc("B panels (fp16)", ns * ks * 128, vld_tail=True)   # TF expands in the k-loop: no panels
         PA0 = LP.alloc("A 0 (compact)", ks * AST, vld_tail=True); PA1 = LP.alloc("A 1 (compact)", ks * AST, vld_tail=True)
         PSTG = LP.alloc("C staging", CROW, vld_tail=True)
         PCB0 = LP.alloc("codes + scales 0", CBB, vld_tail=True); PCB1 = LP.alloc("codes + scales 1", CBB, vld_tail=True)
-        if SP: SPO = LP.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18", 64 * RT, vld_tail=True)
+        if SP: SPO = LP.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (TF: the C start offsets)", SPB, vld_tail=True)
+    # `tern` in rows mode at rt <= 2 (rows 1-8; not "dmaonly"): the C accumulators live in LSRAM, not GSRAM -- a strip's 8 rt
+    # registers compact (256 rt B), a group's ns strips contiguous -- and the strip epilogue is list-scheduled (`strips_tf`).
+    # The prefetch path's group block holds as many groups as the free LSRAM takes (TGBLK).
+    TCS = 256 * RT                                 # tern fast path: a strip's accumulators in LSRAM
+    if TF:
+        LA = LP if PF else LS
+        TGBLK = max(1, min(16, (LA.limit - (-(-LA.used // 32) * 32) - 16) // (ns * TCS))) if PF else 1
+        TACC = LA.alloc("tern: the C accumulators (a group's ns strips x 8 rt registers)", TGBLK * ns * TCS, vld_tail=True)
+        TSTG = PSTG if PF else STG0
     GB_STAMP = LS.limit
     ORDER = [(0, 0), (0, 2), (1, 0), (1, 2), (0, 1), (0, 3), (2, 0), (2, 2), (1, 1), (1, 3), (2, 1), (2, 3)]
     THIS = {0: ["B1", "B3"], 1: ["A2"]}
@@ -4103,6 +4119,16 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                 c.append(BUNDLE(I("%s t%d.fp32, t%d.fp32, %s.fp16, t30.fp16" % (op, 2 * i, 2 * i + 1, AR[i]), f("t%d" % (2 * i), AR[i], "t30"))))
             c += add("r13", "r13", AST)
         c += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
+        if TF:                     # the C start offsets O_j = K_j S' (K = -85/64, -21/16, -5/4, -1): after the k-loop the triangle
+            # C(j) - C(j + 1) / 4 then carries O_j - O_(j+1) / 4 = -S' (O_3 = -S'), so the epilogue has no subtract; [i][j][h] at 32 t
+            for j, kv in enumerate((-85 / 64, -21 / 16, -5 / 4, -1.0)):
+                c += _mov32("r10", struct.unpack("<I", struct.pack("<f", kv))[0]) + [BUNDLE(I("bcast t%d.w, r10" % (20 + j), E.bcast("t%d" % (20 + j), "r10")))]
+            for i in range(RT):
+                for j in range(4):
+                    c.append(BUNDLE(*[I("mul t%d.fp32, t%d.fp32, t%d.fp32, p7.w" % (8 + 2 * j + h, 2 * i + h, 20 + j), E.vmulf("t%d" % (8 + 2 * j + h), "t%d" % (2 * i + h), "t%d" % (20 + j))) for h in (0, 1)]))
+                for q in range(8):
+                    c.append(BUNDLE(I("st t%d, [r7+%d]" % (8 + q, 256 * i + 32 * q), E.vst("t%d" % (8 + q), "r7", 256 * i + 32 * q))))
+            return c
         for i in range(RT):
             c.append(BUNDLE(I("st t%d, [r7+%d]" % (2 * i, 64 * i), E.vst("t%d" % (2 * i), "r7", 64 * i))))
             c.append(BUNDLE(I("st t%d, [r7+%d]" % (2 * i + 1, 64 * i + 32), E.vst("t%d" % (2 * i + 1), "r7", 64 * i + 32))))
@@ -4202,6 +4228,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     def strips(half_reg, stg=None, scl=None, cratio=None):
         """All `ns` strips against the row block in `half_reg`; r13 walks the panels, r15 the C blocks.
         `stg` (drain=dma): the row block's LSRAM staging offset. `scl`: a register holding the slice's codes (scales at +BH)."""
+        if TF: return strips_tf(half_reg, stg, scl or "r20")
         blk = add("r13", "r25", 0) + [BUNDLE(I("mov r27, %d" % ns, E.mov("r27", ns)))]
         if bscale: blk += add("r30", scl or "r20", BH)          # the slice's scales follow its codes
         if DMA_DRAIN:  # r3 = staging buffer, r12 = row block's C in DDR
@@ -4298,6 +4325,180 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
             tail = ifz(last_slice, dr, [])
         return blk + body + tail
 
+    # ---- the tern fast path (TF): a list scheduler for straight-line code, and the strip loops ----
+    # An op: f(m) -> its encodings (alternatives, first that fits wins; m maps virtual registers "%x" to physical), the
+    # registers it reads / writes, its result latency. Virtual registers are allocated in program order (a FIFO free list,
+    # freed after the last use), then ops issue greedily by critical path under the dependences (RAW: the producer's latency;
+    # WAW: the producer's latency; WAR: a later bundle) and the slots (two arithmetic 0/1, the store or a slot-2 op in 2, loads
+    # in 2/3, mov4 / bcast in 3). Latencies: loads 3, fp32 4 (ALU.md: fma), vector integer / moves 2, scalar 1 (interlocked).
+    def tz_op(f, rd=(), wr=(), lat=1): return dict(f=f, r=tuple(rd), w=tuple(wr), lat=lat)
+    def tz_s(asm, enc, rd=(), wr=()): return tz_op(lambda m, a=asm, e=enc: [(a, e)], rd, wr, 1)
+    def tz_ld(d, b_, off): return tz_op(lambda m: [("ld %s, [%s+%d]" % (m(d), b_, off), E.vld(m(d), b_, off))], (b_,), (d,), 3)
+    def tz_st(x, b_, off): return tz_op(lambda m: [("st %s, [%s+%d]" % (m(x), b_, off), E.vst(m(x), b_, off))], (x, b_), (), 1)
+    TZF = {"fma": E.vfmaf, "mul": E.vmulf, "sub": E.vsubf, "add": E.vaddf}
+    def tz_f(op, d, a, b_):        # fp32 d = a op b (fma: d += a x b)
+        return tz_op(lambda m: [("%s %s.fp32, %s.fp32, %s.fp32, p7.w" % (op, m(d), m(a), m(b_)), TZF[op](m(d), m(a), m(b_)))],
+                     (d, a, b_) if op == "fma" else (a, b_), (d,), 4)
+    def tz_ext(op, d, a): return tz_op(lambda m: [("%s %s.w, %s.w, %s.w" % (op, m(d), m(a), m(a)), getattr(E, op)(m(d), m(a), m(a), size="w"))], (a,), (d,), 2)
+    def tz_zero(d): return tz_op(lambda m: [("sub %s.w, %s.w, %s.w" % (d, d, d), E.vsub(d, d, d, size="w")), ("mov4 %s, 0" % d, E.mov4(d, 0))], (d,), (d,), 2)
+    def tz_fit(encs):              # most-constrained first: the order enc.bundle assigns slots in; None if they do not fit
+        order = sorted(encs, key=lambda e: (len(e[1][0]), e[1][0])); used = set()
+        for e in order:
+            sl_ = next((x for x in e[1][0] if x not in used), None)
+            if sl_ is None: return None
+            used.add(sl_)
+        return order
+    def tz_sched(ops, pool=(), ready=None, prio="height"):     # prio: "height" (critical path first) or "order" (program order)
+        last = {}
+        for i, o in enumerate(ops):
+            for x in o["r"] + o["w"]:
+                if x.startswith("%"): last[x] = i
+        free, amap = list(pool), {}
+        for i, o in enumerate(ops):
+            for x in o["w"]:
+                if x.startswith("%") and x not in amap: amap[x] = free.pop(0)
+            for x in dict.fromkeys(o["r"] + o["w"]):
+                if x.startswith("%") and last[x] == i: free.append(amap[x])
+        def m(x): return amap.get(x, x)
+        R = [tuple(m(x) for x in o["r"]) for o in ops]; W = [tuple(m(x) for x in o["w"]) for o in ops]
+        n = len(ops); deps = [[] for _ in range(n)]; lastw, rds = {}, {}
+        for i in range(n):
+            deps[i] += [(lastw[x], ops[lastw[x]]["lat"]) for x in R[i] + W[i] if x in lastw]
+            deps[i] += [(j, 1) for x in W[i] for j in rds.get(x, []) if j != i]
+            for x in R[i]: rds.setdefault(x, []).append(i)
+            for x in W[i]: lastw[x] = i; rds[x] = []
+        succ = [[] for _ in range(n)]
+        for i in range(n):
+            for j, d in deps[i]: succ[j].append((i, d))
+        H = [0] * n
+        for i in reversed(range(n)): H[i] = max([ops[i]["lat"]] + [H[k] + d for k, d in succ[i]])
+        ready = ready or {}; issue = [None] * n; left = set(range(n)); out = []; cyc = 0
+        while left:
+            cand = sorted((i for i in left if all(issue[j] is not None and issue[j] + d <= cyc for j, d in deps[i])
+                           and all(cyc >= ready.get(x, 0) for x in R[i] + W[i])), key=lambda i: (-H[i], i) if prio == "height" else i)
+            chosen = []
+            for i in cand:
+                for alt in ops[i]["f"](m):
+                    if tz_fit([e for _, e in chosen] + [alt]): chosen.append((i, alt)); break
+            for i, _ in chosen: issue[i] = cyc; left.discard(i)
+            out.append(BUNDLE(*tz_fit([e for _, e in chosen]))); cyc += 1
+            assert cyc < 4096, "tz_sched: no progress"
+        return out, issue
+
+    def strips_tf(half_reg, stg, scl):
+        """TF (tern, rows mode, rt <= 2): the group's ns strips against the A slice in `half_reg`; r15 walks the group's
+        LSRAM accumulators (TCS B a strip), r30 the slice's scale table, r14 the row sums S'. Four strip loops, one per slice
+        position (first: C x s -> acc; middle: acc + C x s -> acc, one `fma` (a single rounding); last: acc + C x s -> staging;
+        the only slice: C x s -> staging), chosen once a group step; staging rows past the rt tiles are zeroed once at the
+        start."""
+        bo = [tz_s("add r13, %s, 0" % scl, E.add("r13", scl, 0), (scl,), ("r13",)), tz_s("mov r27, %d" % ns, E.mov("r27", ns), (), ("r27",)),
+              tz_s("mov r8, %d" % BH, E.mov("r8", BH), (), ("r8",)), tz_s("add r30, %s, r8" % scl, E.add("r30", scl, "r8"), (scl, "r8"), ("r30",)),
+              tz_s("mov r10, %d" % stg, E.mov("r10", stg), (), ("r10",)), tz_s("add r3, r25, r10", E.add("r3", "r25", "r10"), ("r25", "r10"), ("r3",)),
+              tz_s("mov r12, %d" % SPO, E.mov("r12", SPO), (), ("r12",)), tz_s("add r14, r25, r12", E.add("r14", "r25", "r12"), ("r25", "r12"), ("r14",)),
+              tz_s("mov r7, 0", E.mov("r7", 0), (), ("r7",)), tz_s("movh r7, %d" % (0xBE80 - 0x10000), E.movh("r7", 0xBE80 - 0x10000), ("r7",), ("r7",)),
+              tz_op(lambda m: [("bcast t31.w, r7", E.bcast("t31", "r7"))], ("r7",), ("t31",), 2)]   # -0.25 (t31: the k-loop leaves it alone at rt <= 2)
+        assert BH < 32768 and stg < 32768 and SPO < 32768
+        blk = tz_sched(bo)[0]
+        # The k-loop expands as it goes (no fp16 panels): r13 walks the strip's codes (32 B a k-step pair, a strip's 16 pairs
+        # contiguous, so the loop leaves r13 at the next strip's), r8 the A slice. A code unit X becomes the pair's 8 B tiles:
+        # Y_0 = X, Y_(j+1) = Y_j << 2 (byte lanes, `lsl .b`, slot 2), tile j of k-step 2p / 2p + 1 = `mul` / `mulh` (Y_j.ub x 1)
+        # (or `zipl` against zero), the fp16 subnormal u(Y_j) x 2^-24 -- the bytes the panel expand wrote. A pair's expand is
+        # four 1-cycle bundles {lsl ; mul, mulh} beside its four (rt 1) / eight (rt 2) 2-cycle mma bundles, software-pipelined
+        # one pair ahead. rt 1: two B sets (t8-15 / t16-23), A t24 / t25 (k-step a / b), X t26, Y t27 / t28, 1 t29, 0 t30.
+        # rt 2: ONE B set t16-23, each tile rewritten right after its two mma bundles (the next pair's), A t24-27 (row tile 0 / 1 of
+        # k-step a, then of b), Y t28 / t29 (the code is loaded into t28), 1 t30. t31 (-0.25) is left alone at both.
+        TONE = "t29" if RT == 1 else "t30"
+        def k_mma(c, a, b_): return I("mma t%d.fp32, t%d.fp32, %s.fp16, %s.fp16" % (c, c + 1, a, b_), E.mma("t%d" % c, a, b_))
+        def k_mul(d, y, hi): return I("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", d, y, TONE), E.vmulb(d, y, TONE, ua=True, high=hi))
+        def k_lsl(d, a): return I("lsl %s.b, %s.b, 2" % (d, a), E.vlsli(d, a, 2, size="b"))
+        def k_ld(d, b_, off): assert 0 <= off < 512; return I("ld %s, [%s+%d]" % (d, b_, off), E.vld(d, b_, off))
+        def k_add(r, x): return I("add %s, %s, %d" % (r, r, x), E.add(r, r, x))
+        def KB(*ops): return BUNDLE(*sorted(ops, key=lambda e: len(e[1][0])))     # slot-2-only ops placed first
+        def sets(base): return {"a": ["t%d" % (base + j) for j in range(4)], "b": ["t%d" % (base + 4 + j) for j in range(4)]}
+        if RT == 1:
+            S_ = [sets(8), sets(16)]; Aa, Ab, X, ya, yb = "t24", "t25", "t26", "t27", "t28"
+            def part(p):
+                cur, nxt = S_[p], S_[1 - p]; oA = 2 * AST * p
+                return [KB(k_mma(0, Aa, cur["a"][0]), k_mma(2, Aa, cur["a"][1]), k_ld(Ab, "r8", oA + AST)),
+                        KB(k_lsl(ya, X), k_mul(nxt["a"][0], X, False), k_mul(nxt["b"][0], X, True)),
+                        KB(k_mma(4, Aa, cur["a"][2]), k_mma(6, Aa, cur["a"][3]), k_ld(X, "r13", 64 if p == 0 else 32)),
+                        KB(k_lsl(yb, ya), k_mul(nxt["a"][1], ya, False), k_mul(nxt["b"][1], ya, True)),
+                        KB(k_mma(0, Ab, cur["b"][0]), k_mma(2, Ab, cur["b"][1]), k_ld(Aa, "r8", oA + 2 * AST)),
+                        KB(k_lsl(ya, yb), k_mul(nxt["a"][2], yb, False), k_mul(nxt["b"][2], yb, True)),
+                        KB(k_mma(4, Ab, cur["b"][2]), k_mma(6, Ab, cur["b"][3])),
+                        KB(I("zipl %s.b, %s.b, t30.b" % (nxt["a"][3], ya), E.zipl(nxt["a"][3], ya, "t30")), k_mul(nxt["b"][3], ya, True),
+                           k_add("r13", 64) if p == 0 else k_add("r8", 4 * AST))]
+            kb = part(0) + part(1)
+            ent = {"S": S_[0], "A": [(Aa, 0)], "X": X}
+        else:
+            S1 = sets(16); A0a, A1a, A0b, A1b, ya, yb = "t24", "t25", "t26", "t27", "t28", "t29"
+            def Ma(j): return [k_mma(2 * j, A0a, S1["a"][j]), k_mma(2 * (4 + j), A1a, S1["a"][j])]
+            def Mb(j): return [k_mma(2 * j, A0b, S1["b"][j]), k_mma(2 * (4 + j), A1b, S1["b"][j])]
+            def Ex(j, y, ny): return ([k_lsl(ny, y)] if j < 3 else []) + [k_mul(S1["a"][j], y, False), k_mul(S1["b"][j], y, True)]
+            def part(p):
+                kA, kB = 2 * p, 2 * p + 1
+                # every load >= 3 bundles before its use, every lsl / mul >= 2 (counted in bundles, not cycles); one load a bundle
+                return [KB(*Ma(0), k_ld(A1b, "r8", kB * AST + 32)), KB(*Ma(1)), KB(*Ma(2)), KB(*Mb(0)), KB(*Ex(0, ya, yb)),
+                        KB(*Ma(3)), KB(*Mb(1), k_ld(A0a, "r8", (kA + 2) * AST)), KB(*Ex(1, yb, ya)),
+                        KB(*Mb(2), k_ld(A1a, "r8", (kA + 2) * AST + 32)), KB(*Ex(2, ya, yb)),
+                        KB(*Mb(3), k_ld(ya, "r13", 32 * (2 + p))), KB(*Ex(3, yb, None), k_ld(A0b, "r8", (kB + 2) * AST))]
+            kb = part(0) + part(1) + [KB(k_add("r8", 4 * AST), k_add("r13", 64))]
+            ent = {"S": S1, "A": [(A0a, 0), (A1a, 32), (A0b, AST)], "X": ya}
+        def pre_ops():             # r8, the k-loop's entry state (A, the first pair expanded, the second's code, the constants), the
+            # loop count, and C = the starting offsets (sprep's table at r14, a load a register). Strip 0's run before the strip
+            # loop; strip s + 1's are scheduled into strip s's epilogue.
+            po = [tz_s("add r8, %s, 0" % half_reg, E.add("r8", half_reg, 0), (half_reg,), ("r8",))]
+            po += [tz_ld(r, "r8", o) for r, o in ent["A"]]
+            po += [tz_op(lambda m, d=d, v=v: [("mov4 %s, %d" % (d, v), E.mov4(d, v))], (), (d,), 2) for d, v in ((TONE, 1),) + ((("t30", 0),) if RT == 1 else ())]
+            ys = [("t27", "t28") if RT == 1 else ("t27", "t29")][0] * 2     # Y_0 .. Y_3 alternating (fixed: no virtual among the entry state)
+            po.append(tz_ld(ys[0], "r13", 0))
+            for j in range(4):
+                if j < 3: po.append(tz_op(lambda m, j=j: [("lsl %s.b, %s.b, 2" % (m(ys[j + 1]), m(ys[j])), E.vlsli(m(ys[j + 1]), m(ys[j]), 2, size="b"))], (ys[j],), (ys[j + 1],), 2))
+                for hi, d in ((False, ent["S"]["a"][j]), (True, ent["S"]["b"][j])):
+                    po.append(tz_op(lambda m, j=j, hi=hi, d=d: [("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", d, m(ys[j]), TONE), E.vmulb(d, m(ys[j]), TONE, ua=True, high=hi))],
+                                    (ys[j], TONE), (d,), 2))
+            po.append(tz_ld(ent["X"], "r13", 32))
+            return po + [tz_s("mov r10, %d" % (ks // kw - 1), E.mov("r10", ks // kw - 1), (), ("r10",))] + [tz_ld("t%d" % t, "r14", 32 * t) for t in range(NC)]
+        def fit_loads(b_, iss, ops, after):   # pad so every vector result (loads 3, vector 2) is ready at the loop (`after` bundles precede it)
+            while max(c + o["lat"] for c, o in zip(iss, ops) if o["lat"] > 1) > len(b_) + after: b_.append(BUNDLE())
+            return b_
+        po0 = pre_ops(); prew0 = {x for o in po0 for x in o["w"]}
+        pre = fit_loads(*tz_sched(po0, pool=[r for r in ("t%d" % r for r in range(NC, 31)) if r not in prew0]), po0, 1)
+        SC = ["%%S%d" % j for j in range(4)]
+        def epi(v):
+            eo = []
+            eo += [tz_ld("%q0", "r30", 0), tz_ld("%q1", "r30", 32), tz_ext("extl", SC[0], "%q0"), tz_ext("exth", SC[1], "%q0"),   # the single
+                   tz_ext("extl", SC[2], "%q1"), tz_ext("exth", SC[3], "%q1")]                                                     # layout's lanes
+            eo.append(tz_s("add r30, r30, %d" % (SCLB // ns), E.add("r30", "r30", SCLB // ns), ("r30",), ("r30",)))
+            for i in range(RT):        # per register, in column-tile order: C(j) -= C(j + 1) / 4 (j < 3: its source still uncorrected),
+                for j in range(4):     # (-S' rides in the k-loop's starting offsets), x the column scale, + the previous slices'
+                    for h in (0, 1):   # accumulator, store
+                        t = 2 * (4 * i + j) + h; x = "t%d" % t
+                        if j < 3: eo.append(tz_f("fma", x, "t%d" % (t + 2), "t31"))
+                        if v in ("M", "L"): eo += [tz_ld("%%A%d" % t, "r15", 32 * t), tz_f("fma", "%%A%d" % t, x, SC[j])]; x = "%%A%d" % t   # acc += C x s, fused
+                        else: eo.append(tz_f("mul", x, x, SC[j]))
+                        eo.append(tz_st(x, "r3" if v in ("L", "FL") else "r15", 32 * t))
+            eo.append(tz_s("add r15, r15, %d" % TCS, E.add("r15", "r15", TCS), ("r15",), ("r15",)))
+            if v in ("L", "FL"): eo.append(tz_s("add r3, r3, 768", E.add("r3", "r3", 768), ("r3",), ("r3",)))
+            eo.append(tz_s("sub r27, r27, 1", E.sub("r27", "r27", 1), ("r27",), ("r27",)))
+            eo += pre_ops()
+            prew = {x for o in pre_ops() for x in o["w"]}       # the pool: registers the next strip's entry state leaves alone first
+            pool = sorted(["t%d" % r for r in range(NC, 31)], key=lambda r: r in prew)
+            return min((fit_loads(*tz_sched(eo, pool=pool, ready={"t%d" % t: 3 for t in range(NC)}, prio=pr), eo, 2)
+                        for pr in ("height", "order")), key=len)
+        def loop(v):               # .Lstrip = the `loop` bundle (strip 0's operands and zeroing precede the loop)
+            lp = [BUNDLE(I("loop r10", E.loop("r10")))] + kb + [BUNDLE(I("loopend", E.loopend()))] + epi(v)
+            return pre + lp + [BUNDLE(I("cbnz r27, .Lstrip", E.cbnz("r27", -len(lp))))]
+        body = ifz(first_slice, ifz(last_slice, loop("FL"), loop("F")), ifz(last_slice, loop("L"), loop("M")))
+        dr = wait_flags(3)             # last slice: the other buffer's drain; this group's C row in DDR -> r12; drain
+        if PF: dr += [BUNDLE(I("sub r12, r16, r28", E.sub("r12", "r16", "r28")))] + _mov32("r7", c_stride) + \
+                     [BUNDLE(I("mul r12, r12, r7", E.mul("r12", "r12", "r7"))), BUNDLE(I("add r12, r12, r2", E.add("r12", "r12", "r2")))]
+        else: dr += [BUNDLE(I("add r12, r2, 0", E.add("r12", "r2", 0)))]
+        dr += _mov32("r7", stg) + [BUNDLE(I("add r3, r25, r7", E.add("r3", "r25", "r7"))), BUNDLE(I("add r14, r23, 64", E.add("r14", "r23", 64))),
+                                    BUNDLE(I("mov r7, 771", E.mov("r7", 771))),
+                                    BUNDLE(I("dma 0, r7, 0, 4, 0, 0, 0, r14, r3, r12", E.dma(E.DMA_DIRECT, "r7", 0, E.DMA_LSRAM, E.DMA_GLOBAL, E.DMA_INT2EXT, E.DMA_USELESS, "r14", "r3", "r12")))]
+        return blk + body + ifz(last_slice, dr, [])
+
     def prefetch(half_reg, flag):
         req = sync(flag) + [dma_in("r7", "r23", half_reg, "r17")] + add("r17", "r17", a_rb_stride)
         return [BUNDLE(I("cbnz r16, .Lpf", E.cbnz("r16", 2))), BUNDLE(I("b .Lskip", E.b(len(req) + 1)))] + req
@@ -4316,6 +4517,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         body += _mov32("r7", BH + SCLB) + [BUNDLE(I("mul r5, r4, r7", E.mul("r5", "r4", "r7")))]
         body += add("r24", "r1", 0) + add("r22", "r1", 0) + add("r17", "r0", 0)
         body += [dma_in("zero", "r26", "r21", "r24")] + sync(1) + [dma_in("r7", "r23", "r11", "r17")]
+    if TF:                         # r29 = the LSRAM accumulators; the staging rows past the rt tiles are zeros for the whole task
+        body += add("r29", "r12", TACC) + [BUNDLE(I("mov4 t0, 0", E.mov4("t0", 0)))] + add("r14", "r12", TSTG)
+        for s_ in range(ns):
+            body += add("r13", "r14", 512) + [BUNDLE(I("st t0, [%s+%d]" % (b_, o_), E.vst("t0", b_, o_))) for t in range(NC, 24)
+                                              for b_, o_ in [("r14", 32 * t) if t < 16 else ("r13", 32 * (t - 16))]] + add("r14", "r14", 768)
     # .Lgroup: zero the C region (nrb x ns blocks)
     grp = [BUNDLE(I("mov4 t0, 0", E.mov4("t0", 0)))] + add("r15", "r29", 0) + add("r16", "r5", 0)
     body_head, body = body, grp
@@ -4343,15 +4549,15 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         sl += add("r1", "r1", BH + SCLB)
         sl += add("r16", "r5", 0) + add("r17", "r22", 0) + add("r15", "r29", 0) + (add("r28", "r2", 0) if rowmax else [])
         sl += dmaq(sync(1) + [dma_in("r7", "r23", "r9", "r17")]) + add("r17", "r17", a_rb_stride)          # row block 0 -> half 0
-        sl += dmaq(wait(0)) + ([] if timing == "dmaonly" else expand("r20" if bscale else None))
+        sl += dmaq(wait(0)) + ([] if timing == "dmaonly" or TF else expand("r20" if bscale else None))
     if PF:
         # Group-blocked (rows mode): blocks of gb <= GBLK groups; per K-slice, A once for the block and B for each group, the
         # groups' C accumulators resident in GSRAM (group g at g x CROW). Registers: r1 block's B base (the next block's is
         # r1 + gb x r5, recomputed where needed: r31 is `zero` and r22-r30 already serve), r16 gb, r18 slices left, r28 groups
         # left in the slice, r19 groups left; r22 / r24 / r17 the last requested B slice base / B / A; r2 the block's first C
         # row in DDR. Each step swaps current / next buffers, then waits and requests.
-        GBLK = max(1, min(16, 65536 // CROW)); SLB = BH + SCLB
-        GsramWindow(f"k_gemm_gs(rows, ns={ns})").alloc("group block's C rows", GBLK * CROW)
+        GBLK = TGBLK if TF else max(1, min(16, 65536 // CROW)); SLB = BH + SCLB
+        if not TF: GsramWindow(f"k_gemm_gs(rows, ns={ns})").alloc("group block's C rows", GBLK * CROW)
         assert c_stride % CROW == 0 and (c_stride // CROW) & (c_stride // CROW - 1) == 0, "group-blocked C: c_stride a power-of-two multiple of CROW"
         def mv(d, s_): return [BUNDLE(I("add %s, %s, 0" % (d, s_), E.add(d, s_, 0)))]
         def swap(a, b_): return mv("r7", a) + mv(a, b_) + mv(b_, "r7")
@@ -4363,7 +4569,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         nxt_blk = [BUNDLE(I("mul r7, r16, r5", E.mul("r7", "r16", "r5"))), BUNDLE(I("add r24, r1, r7", E.add("r24", "r1", "r7")))] + mv("r22", "r24")
         step += ifz(last_group, ifz(last_slice, ifz(last_block, [], nxt_blk + reqB), add("r22", "r22", SLB) + mv("r24", "r22") + reqB),
                     [BUNDLE(I("add r24, r24, r5", E.add("r24", "r24", "r5")))] + reqB)
-        step += expand("r20")
+        step += [] if TF else expand("r20")
         step += ifz(last_slice, wait_flags(3), [])
         step += strips("r9", PSTG - BREG, scl="r20", cratio=c_stride // CROW)
         step += [BUNDLE(I("sub r28, r28, 1", E.sub("r28", "r28", 1)))]
