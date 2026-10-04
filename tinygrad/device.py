@@ -331,6 +331,7 @@ def is_dtype_supported(dtype:DType, device:str|None=None, arch:str|None=None) ->
       case "PYTHON" | "NULL": return True
       case _: return False
   if dtype in dtypes.fp8_fnuz: return target.device in {"PYTHON", "NULL"}
+  if target.device == "ZHOUYI" and dtype in (dtypes.long, dtypes.ulong, dtypes.float64): return False
   if target.device == "WEBGPU": return dtype in [dtypes.bool, dtypes.char, dtypes.uchar, dtypes.short,
                                                  dtypes.ushort, dtypes.float, dtypes.int32, dtypes.uint32, dtypes.half]
   # for CI GPU and OSX, cl_khr_fp16 isn't supported

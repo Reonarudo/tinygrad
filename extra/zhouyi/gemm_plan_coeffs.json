@@ -1,0 +1,27 @@
+{
+ "coeffs": {
+  "mma": 1.0454523570872418,
+  "gs_vec": 5.59216109676007,
+  "exp_bun": 1.0923984113212455,
+  "bs_bun": 3.737611689026353,
+  "strip": 91.86290514900156,
+  "rb": 15.721274546450466,
+  "slice": 128.67324311882285,
+  "group": 131.26721840591108,
+  "req": 362.72541279591877,
+  "tec_rate": 5.627349112188903,
+  "ddr_rate": 19.972173480167605,
+  "launch": 0.0002559828380326782,
+  "call": 1.2008567945029882e-05,
+  "ls_vst": 1.6155147549396136,
+  "ddr_vst": 146.05328466290229
+ },
+ "source": "device timings of gemm_gs (Zhouyi V3, 3 cores x 4 TECs, 1.2034 GHz), 2026-09-30: 111 calibration configurations, 5 repetitions, median; fit: gemm_plan.fit(names=FIT, prior SIGMA)",
+ "errors": {
+  "calib": "median 1.1 %, max 12.0 %",
+  "holdout (61)": "median 1.4 %, 90th 6.4 %, max 15.2 %, 98 % within 15 %",
+  "sites (22)": "median 0.9 %, max 8.9 %",
+  "verify (13)": "median 0.6 %, max 5.8 %"
+ },
+ "clock_hz": 1203400000.0
+}

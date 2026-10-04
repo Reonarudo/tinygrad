@@ -1,4 +1,4 @@
-import glob, importlib, os, pathlib, shutil, subprocess, tarfile, tempfile
+import glob, importlib, os, pathlib, re, shutil, subprocess, tarfile, tempfile
 from tinygrad.helpers import fetch, flatten, system, getenv
 
 root = (here:=pathlib.Path(__file__).parent).parents[2]
@@ -39,6 +39,19 @@ def load(name, dll, files, **kwargs):
     if srcs: td.cleanup()
   return importlib.import_module(f"{path}.{name.replace('/', '.')}")
 
+AIPU_HEADER_PATHS = ["/usr/src/zhouyi-aipu-*/include/armchina_aipu.h",    # the KMD's DKMS source package (matches the loaded driver)
+                     "/usr/include/misc/armchina_aipu.h", "/usr/include/linux/armchina_aipu.h",   # UAPI install paths
+                     "/usr/share/cix/include/npu/kmd/armchina_aipu.h"]  # the vendor NPU SDK
+def aipu_header() -> str:
+  """The Zhouyi KMD's UAPI header `armchina_aipu.h`: `ZHOUYI_AIPU_HEADER`, else the first of AIPU_HEADER_PATHS that exists."""
+  if (env:=os.getenv("ZHOUYI_AIPU_HEADER")):
+    if not os.path.isfile(env): raise FileNotFoundError(f"ZHOUYI_AIPU_HEADER={env}: no such file")
+    return env
+  for pat in AIPU_HEADER_PATHS:
+    if (hits:=sorted(glob.glob(pat), key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", p)])): return hits[-1]
+  raise FileNotFoundError("ZHOUYI: the Zhouyi KMD's UAPI header armchina_aipu.h was not found (searched " + ", ".join(AIPU_HEADER_PATHS) +
+                          "). Install the NPU kernel driver's headers, or set ZHOUYI_AIPU_HEADER=/path/to/armchina_aipu.h")
+
 def __getattr__(nm):
   match nm:
     case "libc": return load("libc", "'c'", lambda: (
@@ -50,6 +63,11 @@ def __getattr__(nm):
     case "nvrtc": return load("nvrtc", "'nvrtc'", ["/usr/include/nvrtc.h"], paths=nv_lib_path, prolog=["import sysconfig"])
     case "nvjitlink": load("nvjitlink", "'nvJitLink'", [root/"extra/nvJitLink.h"], paths=nv_lib_path, prolog=["import sysconfig"])
     case "kfd": return load("kfd", None, [root/"extra/hip_gpu_driver/kfd_ioctl.h"])
+    # the Zhouyi KMD's UAPI header is not bundled: it comes from the installed driver (aipu_header). Off Linux, the kernel's
+    # linux/types.h and linux/ioctl.h come from the Debian linux-libc-dev package, as for pci / vfio.
+    case "aipu": return load("aipu", None, lambda: [aipu_header()], **({} if os.path.exists("/usr/include/linux/ioctl.h") else dict(
+      args=["-I{}/usr/include", "-I{}/usr/include/aarch64-linux-gnu"], srcs=linux_headers_deb,
+      preprocess=lambda path: subprocess.run(f"ar x {linux_headers_deb.split('/')[-1]} && tar xf data.tar.xz", cwd=path, shell=True, check=True))))
     case "nv_570" | "nv_580":
       return load(nm, None, [
         *[root/"extra/nv_gpu_driver"/s for s in ["clc9b0.h", "clc6c0qmd.h","clcec0qmd.h", "nvdec_drv.h"]], "{}/kernel-open/common/inc/nvmisc.h",

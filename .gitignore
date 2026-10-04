@@ -68,3 +68,6 @@ mutants
 .mutmut-cache
 dagre/
 graphlib/
+
+# generated on first use from the installed Zhouyi KMD UAPI header (not bundled; see extra/zhouyi/README.md)
+tinygrad/runtime/autogen/aipu.py
