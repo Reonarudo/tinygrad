@@ -50,7 +50,7 @@ def unpack_c_gs(c_bytes: bytes, nrb: int, ns: int) -> np.ndarray:
 SCALE_LAYOUTS = ("dup", "single")   # the E4M3 block-scale table's layout: [s][j][c0 c1 c2 c3 c0 c1 c2 c3] (128 B a strip) / [s][j][c0 c1 c2 c3] (64 B)
 
 
-def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup") -> int:
+def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup") -> int:   # (tern: the single E4M3 layout, ns x 64 B)
     """A K-slice's scale table in a block-scaled gemm_gs stream: E4M3 (q8 0) [s][4 tiles][8] fp32 = 128 B a strip (`scales`
     "dup": each scale stored twice, the kernel's lane layout) or [s][4 tiles][4] fp32 = 64 B a strip ("single": each once, the
     kernel widens it); Q8_0 with the correction kernel (q8 1, ks 8) 16 fp16 a strip; Q8_0 dequantised in fp16 (q8 2) 16 fp16 a
@@ -60,14 +60,14 @@ def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup") -> int:
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
-                   prefetch: bool = False, q8: int = 0, scales: str = "dup") -> bytes:
+                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False) -> bytes:
     """+0 the A row-block slice (`a_bytes`, default ks x 96; rows mode: the compact ks x 32 rt), +32 the B group slice (fp16, or
     the E4M3 codes with `b8`), +64 the row block's C drain (`k_gemm_gs(drain="dma")`; + its 192 B of row maxima with `rowmax`),
     +96 the slice's scale table (`bscale`, ns x 128 B, or ns x 64 B with `scales="single"`), +128 (`prefetch`: k_gemm_gs rows
-    mode) a slice's codes and scales in one."""
+    mode) a slice's codes and scales in one (`tern`: 2-bit codes, ns x ks x 16 B)."""
     scl = gs_scale_bytes(ns, ks, q8, scales)                                     # a slice's scale table
     ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), D.desc_words(ns * 768 + (192 if rowmax else 0))] + ([D.desc_words(scl)] if bscale else [])
-    if prefetch or bscale: ws.append(D.desc_words(ns * ks * 64 + scl))            # +128: a slice's codes + scales in one request
+    if prefetch or bscale: ws.append(D.desc_words(ns * ks * (16 if tern else 64) + scl))   # +128: a slice's codes + scales in one request
     out = bytearray(32 * len(ws))
     for i, w in enumerate(ws): out[32 * i:32 * i + 24] = np.asarray(w, np.uint32).tobytes()
     return bytes(out)
@@ -90,6 +90,24 @@ def pack_b_group_bscale(b_e4m3: np.ndarray, scale_inv: np.ndarray, group: int, n
     sc = sc.T.reshape(K // 128, ns, 4, 4)                                                                                   # [slice][s][j][c]
     scv = np.ascontiguousarray(np.concatenate([sc, sc], -1) if scales == "dup" else sc).reshape(K // 128, -1).view(np.uint8)   # [slice][s j (c c)] / [slice][s j c] fp32
     return np.ascontiguousarray(np.concatenate([panels, scv], 1)).ravel()
+
+
+def pack_b_group_tern(w: np.ndarray, scale: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
+    """Ternary g128 B `[N, K]` (int8 {-1, 0, +1}; `scale[N, K/128]` the per-column group scale, fp16 values) -> `k_gemm_gs(b8=True,
+    bscale=True, scales="single", tern=True, ks=32)`'s stream for strips `group*ns .. +ns`: per K-slice (one scale group) the
+    2-bit codes c = w + 1, then the single-layout fp32 table [s][j][c0 c1 c2 c3] = scale x 2^18 (64 B a strip). Codes: per strip
+    and k-step pair 32 B; byte 16 h + 4 n + k (h the k-step of the pair, n / k the tile's column / k lane) holds tile j's code in
+    bits 7 - 2j : 6 - 2j (tile 0 on top). A slice is ns x ks x 16 + ns x 64 B. Rows past N: code 1 (w = 0), scale 0."""
+    N, K = w.shape; assert 4 * ks == 128 and K % 128 == 0 and ks % 2 == 0 and scale.shape == (N, K // 128), (w.shape, scale.shape)
+    r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // 128; nr = max(0, min(N, r1) - r0)
+    c = np.ones((16 * ns, K), np.uint8); c[:nr] = (w[r0:r0 + nr].astype(np.int16) + 1).astype(np.uint8)
+    assert c.max(initial=0) <= 2, "ternary weights only"
+    t = c.reshape(ns, 4, 4, nsl, ks // 2, 2, 4).transpose(3, 0, 4, 5, 1, 2, 6)                      # [slice][s][q][h][j][n][k]
+    t = t.reshape(nsl, ns, ks // 2, 2, 4, 16).astype(np.uint16)
+    codes = (t[..., 0, :] << 6 | t[..., 1, :] << 4 | t[..., 2, :] << 2 | t[..., 3, :]).astype(np.uint8).reshape(nsl, -1)   # [slice][s q h l]
+    sc = np.zeros((16 * ns, nsl), np.float32); sc[:nr] = scale[r0:r0 + nr].astype(np.float32) * np.float32(2.0 ** 18)
+    scv = np.ascontiguousarray(sc.T).reshape(nsl, -1).view(np.uint8)                                   # [slice][s j c] fp32
+    return np.ascontiguousarray(np.concatenate([codes, scv], 1)).ravel()
 
 
 def bscale_stream_single(stream: np.ndarray, ns: int, ks: int) -> np.ndarray:

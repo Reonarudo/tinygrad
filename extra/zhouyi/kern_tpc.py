@@ -3792,7 +3792,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
-              rows=None, poison=False, q8=False, q8f=False, scales="dup"):
+              rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3838,8 +3838,18 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # (64 B a strip, `pack_b_group_bscale(scales="single")`): one 32-B load carries tiles j and j + 1, and `extl` / `exth` of
     # the register with itself rebuild the duplicated lanes (the q8 path's widening below) -- the same fp32 values in the same
     # multiplies, so C is bit-identical; a slice's request shrinks by ns x 64 B (6528 -> 6336 B at ns 3). The buffers follow SCLB.
+    # `tern` (b8 + bscale + scales="single"): ternary g128 weights {-1, 0, +1}, a scale per (column, 128-wide K-slice), as
+    # 2-bit codes c = w + 1 (`gemm_fp16.pack_b_group_tern`): per (strip, k-step pair) 32 B, byte 16 h + l (h the k-step, l the
+    # tile lane 4 n + k) holding tile j's code in bits 7-2j:6-2j. `expand_tern` makes Y_j = 4^j X mod 256 (byte `add`s, which
+    # wrap) and widens it (byte `mul` / `mulh` x 1, slots 0/1) into tile j's lanes as the fp16 subnormal u(Y_j) x 2^-24 =
+    # (64 c_j + 16 c_(j+1) + 4 c_(j+2) + c_(j+3)) x 2^-24: no shift or mask, the stores are the only slot-2 ops. The mixing is
+    # across the strip's COLUMN tiles, so after the k-loop C(j) -= C(j+1) / 4 (j = 0, 1, 2, in that order) leaves C(j) =
+    # 64 x 2^-24 A c_j; the offset (c = w + 1) is q8's pre-pass (`sprep`, constant 64 x 2^-24) and C -= S'; the single-layout
+    # table carries s x 2^18. Exact before the scale multiply (integer lanes, power-of-two steps).
     assert scales in ("dup", "single"), scales
     SSC = scales == "single"
+    assert not tern or (b8 and bscale and SSC and not q8 and not q8f and ks % 2 == 0 and kw == 4), "k_gemm_gs(tern): b8 + bscale + scales='single'"
+    SP = q8 or tern                                # the A row-sum pre-pass and C -= S' (q8: the +128 offset; tern: c = w + 1)
     assert not SSC or (bscale and not q8 and not q8f), "k_gemm_gs(scales='single'): the E4M3 block-scale stream (bscale, not q8 / q8f)"
     V2 = b8 and not q8 and not q8f and not (ks == 48 and ns == 3)
     assert not q8 or (b8 and bscale), "k_gemm_gs(q8): b8 + bscale"
@@ -3872,7 +3882,8 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # 16-bit lane becomes `((code << 8) asr 1) & 0xBFFF`, the fp16 of code x 2^-8, exact for all 254 non-NaN codes
     # (NaN codes 0x7f / 0xff read as +-1.875). C comes out x 2^-8; the caller's per-channel scale carries 2^8.
     # Row block 0's A request is issued before the expansion so they overlap.
-    BH = ns * ks * (64 if b8 else 128)          # B bytes a slice from DDR
+    BH = ns * ks * (16 if tern else 64 if b8 else 128)   # B bytes a slice from DDR (tern: 2-bit codes)
+    TU = next(u for u in (3, 2, 1) if (BH // 32) % u == 0) if tern else 0   # tern: 32-B code units an expand iteration
     # Diagnostic `timing` (wrong results, timing only): "noc" skips the middle slices' GSRAM C loads/stores;
     # "gs{x}{n}" adds n GSRAM accesses of t31 at r15 per 3-k-step body (x: "l" alternating ld/st, "o" loads, "s" stores).
     # "dmaonly" / "nodma" (rows mode, diagnostics, wrong results): only the DMAs and their waits / only the expansion and compute
@@ -3898,9 +3909,9 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     BREG = LS.alloc("B panels (fp16)", ns * ks * 128, vld_tail=True)
     A0 = LS.alloc("A half 0", ks * 96, vld_tail=True); A1 = LS.alloc("A half 1", ks * 96, vld_tail=True)
     STG0 = LS.alloc("C staging 0", CROW, vld_tail=True); STG1 = LS.alloc("C staging 1", CROW, vld_tail=True)
-    CBB = BH + (max(SCLB, 128) if V2 else SCLB)   # the codes + scales buffer: expand_v2's pipeline reads 128 B past the codes (a table under 128 B is padded)
+    CBB = BH + (max(SCLB, 32 * TU) if tern else max(SCLB, 128) if V2 else SCLB)   # the codes + scales buffer: expand_v2's pipeline reads 128 B past the codes (a table under 128 B is padded)
     CB = LS.alloc("bscale: a slice's codes + scales", CBB, vld_tail=True) if bscale else STG1 + CROW
-    SPO = LS.alloc("q8: the A slice's row sums x 2^-17 (a pair a row tile)", 64 * RT, vld_tail=True) if q8 else None
+    SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile)", 64 * RT, vld_tail=True) if SP else None
     # rows mode, rt <= 2, block-scaled E4M3: the next slice's B (codes + scales, one DMA through DESC +128) and compact A are
     # requested while the current slice expands and computes. LSRAM: fp16 panels [0, 2 BH) | A x2 | one staging | B x2
     PF = SINGLE and RT <= 2 and b8 and bscale and timing is None
@@ -3910,7 +3921,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         PA0 = LP.alloc("A 0 (compact)", ks * AST, vld_tail=True); PA1 = LP.alloc("A 1 (compact)", ks * AST, vld_tail=True)
         PSTG = LP.alloc("C staging", CROW, vld_tail=True)
         PCB0 = LP.alloc("codes + scales 0", CBB, vld_tail=True); PCB1 = LP.alloc("codes + scales 1", CBB, vld_tail=True)
-        if q8: SPO = LP.alloc("q8: the A slice's row sums x 2^-17", 64 * RT, vld_tail=True)
+        if SP: SPO = LP.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18", 64 * RT, vld_tail=True)
     GB_STAMP = LS.limit
     ORDER = [(0, 0), (0, 2), (1, 0), (1, 2), (0, 1), (0, 3), (2, 0), (2, 2), (1, 1), (1, 3), (2, 1), (2, 3)]
     THIS = {0: ["B1", "B3"], 1: ["A2"]}
@@ -4081,7 +4092,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         return e + body + [BUNDLE(I("loopend", E.loopend()))]
 
     def sprep(half_reg):           # q8: S'_i = the A slice's row sums x 2^-17 per row tile i (mml / mma against a constant tile) -> scratch
-        c = _mov32("r7", 0x00800080) + [BUNDLE(I("bcast t30.w, r7", E.bcast("t30", "r7")))]      # fp16 2^-17 (bits 0x0080) in every half
+        c = _mov32("r7", 0x00400040 if tern else 0x00800080) + [BUNDLE(I("bcast t30.w, r7", E.bcast("t30", "r7")))]      # fp16 2^-17 (bits 0x0080; tern 2^-18, 0x0040) in every half
         c += add("r13", half_reg, 0)
         AR = ["t26", "t27", "t28"]
         for k in range(ks):
@@ -4121,8 +4132,72 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
             body[-1] = BUNDLE(*(list(body[-1]) + [I("add r14, r14, 256", E.add("r14", "r14", 256))]))
             e += body + [BUNDLE(I("loopend", E.loopend()))]
         return e
+    def expand_tern(src):          # 2-bit codes at `src` (BH B) -> the fp16 panels [r25, r25 + 8 BH): tile j's lanes u(4^j X mod 256) x 2^-24
+        # One iteration = TU 32-B code units (each 128 weights = a strip's k-step pair = 256 B of panels): per unit 6 byte `add`s
+        # (X -> 2X -> 4X ... 64X, wrapping), 8 widening `mul` / `mulh` by 1 (Y_j unsigned) and 8 stores; scheduled below under the
+        # measured rules (2 ALU ops a bundle, one store, loads beside a store or in pairs, 2-cycle vector latency, 3-cycle
+        # load-to-use). The next iteration's codes load in this one (after the last read of X), so the last iteration reads
+        # 32 TU B past the codes: the scale table (CBB pads it).
+        CU = [tuple("t%d" % (23 + 3 * u + v) for v in range(3)) for u in range(TU)]   # X, T, Y per unit: t23 .. t31
+        ONE = "t0"; POOL = ["t%d" % r for r in range(1, 23)]
+        e = [BUNDLE(I("mov4 t0, 1", E.mov4("t0", 1)))] + add("r13", src, 0) + add("r14", "r25", 0) + add("r12", "r25", 512)
+        def LDX(u): return I("ld %s, [r13+%d]" % (CU[u][0], 32 * u), E.vld(CU[u][0], "r13", 32 * u))
+        e += [BUNDLE(*[LDX(u) for u in range(u0, min(TU, u0 + 2))]) for u0 in range(0, TU, 2)]
+        e += [BUNDLE(I("add r13, r13, %d" % (32 * TU), E.add("r13", "r13", 32 * TU))),
+              BUNDLE(I("mov r10, %d" % (BH // (32 * TU) - 1), E.mov("r10", BH // (32 * TU) - 1))), BUNDLE(I("loop r10", E.loop("r10")))]
+        # ops of one iteration: name -> kind, deps (RAW: (name, latency)), after (WAR: issued in an earlier bundle), emitter
+        ops = []
+        def ADD(n, d, a, deps, after=()): ops.append(dict(n=n, k="alu", deps=deps, after=list(after), f=lambda d=d, a=a: I("add %s.b, %s.b, %s.b" % (d, a, a), E.vadd(d, a, a, size="b"))))
+        for u in range(TU):
+            X, T, Y = CU[u]
+            ADD(f"t{u}0", T, X, [])                                          # T = 2X
+            for j in range(4):
+                yj, dep = (X, []) if j == 0 else (Y, [(f"y{u}{j}", 2)])
+                for hi in (0, 1): ops.append(dict(n=f"m{u}{j}{hi}", k="mul", deps=dep, after=[], y=yj, hi=hi, u=u, j=j))
+                if j == 3: break
+                if j > 0: ADD(f"t{u}{j}", T, Y, [(f"y{u}{j}", 2)])          # T = 2 Y_j
+                ADD(f"y{u}{j+1}", Y, T, [(f"t{u}{j}", 2)], [f"m{u}{j}0", f"m{u}{j}1", f"t{u}{j}"] if j else [])   # Y = 4 Y_j
+        H = {}                                                               # priority: the longest path to a store (RAW latency, WAR 1)
+        def height(n):
+            if n not in H:
+                H[n] = max([2] + [height(o["n"]) + l for o in ops for a, l in o["deps"] if a == n] + [height(o["n"]) + 1 for o in ops if n in o["after"]])
+            return H[n]
+        for o in ops: height(o["n"])                                         # before the sort (list.sort empties the list it sorts)
+        ops.sort(key=lambda o: (-H[o["n"]], o["n"][1], o["n"]))
+        done, sched, free_at, stores = {}, [], {r: 0 for r in POOL}, []
+        pending = list(ops); cyc = 0; loads_left = list(range(TU)); ptr_done = False
+        def ok(op): return all(a in done and done[a] + l <= cyc for a, l in op["deps"]) and all(a in done and done[a] < cyc for a in op["after"])
+        while pending or stores or loads_left or not ptr_done:
+            alu, mem = [], []
+            feed = len(stores) < 2                                           # keep the store slot fed: products first when few are queued
+            for op in sorted(pending, key=lambda o: (not (feed and o["k"] == "mul"), pending.index(o))):
+                if len(alu) == 2: break
+                if not ok(op): continue
+                if op["k"] == "mul":
+                    reg = next((r for r in POOL if free_at[r] <= cyc), None)
+                    if reg is None: continue
+                    free_at[reg] = 10 ** 9; u, j, hi = op["u"], op["j"], op["hi"]
+                    alu.append(I("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", reg, op["y"], ONE), E.vmulb(reg, op["y"], ONE, ua=True, high=bool(hi))))
+                    stores.append((cyc + 2, 256 * u + 128 * hi + 32 * j, reg))
+                else: alu.append(op["f"]())
+                done[op["n"]] = cyc; pending.remove(op)
+            st = min((x for x in stores if x[0] <= cyc), default=None)       # a store: the oldest ready product
+            if st:
+                stores.remove(st); _, off, reg = st; base, o = ("r14", off) if off < 512 else ("r12", off - 512)
+                mem.append(I("st %s, [%s+%d]" % (reg, base, o), E.vst(reg, base, o))); free_at[reg] = cyc + 1
+            for u in list(loads_left):                                        # the next iteration's codes, once X is dead
+                if len(mem) < 2 and all(n in done and done[n] < cyc for n in (f"t{u}0", f"m{u}00", f"m{u}01")): mem.append(LDX(u)); loads_left.remove(u)
+            if not loads_left and not ptr_done and len(alu) < 2:              # r13 once the loads are issued
+                alu.append(I("add r13, r13, %d" % (32 * TU), E.add("r13", "r13", 32 * TU))); ptr_done = True
+            sched.append(BUNDLE(*alu, *mem)); cyc += 1
+        sched.append(BUNDLE(I("add r14, r14, %d" % (256 * TU), E.add("r14", "r14", 256 * TU)), I("add r12, r12, %d" % (256 * TU), E.add("r12", "r12", 256 * TU))))   # the store bases, after every store
+        # the next iteration's first use of X is >= 3 cycles after its load (body tail + loopend)
+        last_ld = max(i for i, b in enumerate(sched) if any(x[0].startswith("ld ") for x in b))
+        while len(sched) + 1 - last_ld < 3: sched.append(BUNDLE())
+        return e + sched + [BUNDLE(I("loopend", E.loopend()))]
     if q8: expand = expand_q8
     if q8f: expand = expand_q8f
+    if tern: expand = expand_tern
 
     def strips(half_reg, stg=None, scl=None, cratio=None):
         """All `ns` strips against the row block in `half_reg`; r13 walks the panels, r15 the C blocks.
@@ -4155,6 +4230,19 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         if stamps: body += [CYC("r30")]
         body += [BUNDLE(I("loop r10", E.loop("r10")))] + kbody + [BUNDLE(I("loopend", E.loopend()))]
         if stamps: body += [CYC("r7")] + acc("r21", "r30", "r7") + [CYC("r30")]
+        if tern:                   # C(j) -= C(j + 1) / 4 (j = 0, 1, 2: each reads the next tile before it is corrected), then C -= S'
+            body += _mov32("r7", 0xBE800000) + [BUNDLE(I("bcast t31.w, r7", E.bcast("t31", "r7")))]     # -0.25 (t31: free after the k-loop at every RT)
+            for i in range(RT):
+                for j in range(3):
+                    c, d = 2 * (4 * i + j), 2 * (4 * i + j + 1)
+                    body.append(BUNDLE(*[I("fma t%d.fp32, t%d.fp32, t31.fp32, p7.w" % (c + h, d + h), E.vfmaf("t%d" % (c + h), "t%d" % (d + h), "t31")) for h in (0, 1)]))
+            body += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
+            for i in range(RT):
+                body.append(BUNDLE(I("ld t28, [r7+%d]" % (64 * i), E.vld("t28", "r7", 64 * i)), I("ld t29, [r7+%d]" % (64 * i + 32), E.vld("t29", "r7", 64 * i + 32))))
+                for j in range(4):
+                    c = 2 * (4 * i + j)
+                    body.append(BUNDLE(I("sub t%d.fp32, t%d.fp32, t28.fp32, p7.w" % (c, c), E.vsubf("t%d" % c, "t%d" % c, "t28")),
+                                       I("sub t%d.fp32, t%d.fp32, t29.fp32, p7.w" % (c + 1, c + 1), E.vsubf("t%d" % (c + 1), "t%d" % (c + 1), "t29"))))
         if bscale and q8:          # C -= S' (the codes' +128), then x the strip's 16 scales: fp16 d x 2^10 -> fp32 d x 2^24, lanes [c0..c3 c0..c3]
             body += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
             for i in range(RT):
@@ -4282,7 +4370,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         step.append(BUNDLE(I("cbnz r28, .Lstep", E.cbnz("r28", -len(step)))))
         slc = mv("r28", "r16") + mv("r15", "r29") + swap("r9", "r11") + wait(1)
         slc += ifz(last_slice, ifz(last_block, [], mv("r17", "r0") + reqA), [BUNDLE(I("add r17, r17, r6", E.add("r17", "r17", "r6")))] + reqA)
-        slc += (sprep("r9") if q8 else []) + step + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
+        slc += (sprep("r9") if SP else []) + step + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
         slc.append(BUNDLE(I("cbnz r18, .Lslc", E.cbnz("r18", -len(slc)))))
         blk = _mov32("r7", GBLK) + [BUNDLE(I("mn r16, r19, r7", E.mn("r16", "r19", "r7")))]
         blk += mv("r18", "r4")
@@ -4294,13 +4382,13 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     if SINGLE:                     # row block 0 only; its one staging buffer: the previous group's drain must be done first
         # the previous group's drain (flag 3) -- none in "dmaonly", which drains nothing: no wait on a flag nobody raises
         rb = dmaq(wait(1)) + ([] if timing == "dmaonly" else ifz(last_slice, wait_flags(3), []))
-        rb += [] if timing == "dmaonly" else (sprep("r9") if q8 else []) + strips("r9", STG0 - BREG)
+        rb += [] if timing == "dmaonly" else (sprep("r9") if SP else []) + strips("r9", STG0 - BREG)
     else:
         rb = [BUNDLE(I("sub r16, r16, 2", E.sub("r16", "r16", 2)))]
         rb += wait(1) + sync(2) + [dma_in("r7", "r23", "r11", "r17")] + add("r17", "r17", a_rb_stride)  # odd row block -> half 1
-        rb += (sprep("r9") if q8 else []) + strips("r9", STG0 - BREG)
+        rb += (sprep("r9") if SP else []) + strips("r9", STG0 - BREG)
         rb += wait(2) + prefetch("r9", 1)
-        rb += (sprep("r11") if q8 else []) + strips("r11", STG1 - BREG)
+        rb += (sprep("r11") if SP else []) + strips("r11", STG1 - BREG)
         rb.append(BUNDLE(I("cbnz r16, .Lrb", E.cbnz("r16", -len(rb)))))
     if not PF:
         sl += rb

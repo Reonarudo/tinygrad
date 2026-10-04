@@ -11,9 +11,9 @@ kernel driver's `/dev/aipu` (no vendor user-mode runtime). Consecutive launches 
 | `tinygrad/runtime/support/compiler_zhouyi.py` | `ZhouyiCompiler`: the installed toolchain in-process, the image's vector table and task epilogue, ELF lift |
 | `tinygrad/runtime/support/zhouyi/` | `dev.py` raw ioctl submit path and TCB chains, `launch.py` per-launch buffers, `elf.py`, `hangid.py` |
 | `tinygrad/runtime/autogen/__init__.py` | `aipu`: the KMD bindings, generated on first use (below) |
-| `extra/zhouyi/ops.py` | custom ops, lowered from `Ops.CUSTOM_FUNCTION` (importing it installs them; each is a graph chain member): `gemm_gs` (hand-written fp16 / E4M3 / Q8_0 GEMM on the matrix unit, `GemmGSRunner`; `GemmGMRunner` with `ZHOUYI_GM=1`), `e4m3_stream`, `register_csrc` / `csrc_call` (a hand-written C kernel as an ordinary Program), `host_invalidate` |
+| `extra/zhouyi/ops.py` | custom ops, lowered from `Ops.CUSTOM_FUNCTION` (importing it installs them; each is a graph chain member): `gemm_gs` (hand-written fp16 / E4M3 / Q8_0 / ternary GEMM on the matrix unit, `GemmGSRunner`; `GemmGMRunner` with `ZHOUYI_GM=1`), `e4m3_stream`, `register_csrc` / `csrc_call` (a hand-written C kernel as an ordinary Program), `host_invalidate` |
 | `extra/zhouyi/kern_tpc.py` | TEC kernels as (assembly, encoder) pairs: `k_gemm_gs` and its variants, `k_gemm_gm`, `k_gm_stage`, `k_e4m3_stream`; ALU / vector / LSRAM / GSRAM / GM / DMA / sync / control-register probes and benchmarks |
-| `extra/zhouyi/gemm_fp16.py` | the GEMM operand packers (`pack_a_slices`, `pack_b_group*`, `repack_panels_48x3`, `bscale_stream_single`), `unpack_c_gs`, descriptor tables |
+| `extra/zhouyi/gemm_fp16.py` | the GEMM operand packers (`pack_a_slices`, `pack_b_group*` incl. `pack_b_group_tern`, `repack_panels_48x3`, `bscale_stream_single`), `unpack_c_gs`, descriptor tables |
 | `extra/zhouyi/gemm_plan.py`, `gemm_plan_coeffs.json` | an analytic cost model of `gemm_gs` and `plan` / `plan_piece`. The JSON holds per-operation costs (cycles per `mma`, per GSRAM vector, per DMA request, DDR rate, ...) fitted to device timings of 111 calibration configurations: a generic hardware cost model, not tied to any model's shapes |
 | `extra/zhouyi/vec_f16.py` | helpers for hand-written vector kernels: the C header (`H`, `FULL_H`), the GEMM layouts and numpy references, `_desc_slots`, `dma_copy_src`, `tec_sum_src` |
 | `extra/zhouyi/enc.py`, `image.py` | the VLIW encoder; the image writer (`text_only`) and `build_encoded`, which byte-diffs an image against the installed assembler |
@@ -21,6 +21,30 @@ kernel driver's `/dev/aipu` (no vendor user-mode runtime). Consecutive launches 
 | `extra/zhouyi/timing.py`, `toolchain.py` | `submit_and_wait` and the process-wide timing `Recorder`; the toolchain as an assembler oracle |
 
 Models built on this backend (and their model-specific kernels) live in the examples repository.
+
+## `gemm_gs` weight formats
+
+`gemm_gs(a, b, ...)` computes `C = A @ B^T` with fp16 A (the `pack_a_slices` layout, or the compact rows-mode layout) and fp32 C.
+The weight stream `b` is one of these; the caller passes the flags its stream was packed with.
+
+| format | packer | `gemm_gs` flags | bytes / weight | C |
+| --- | --- | --- | ---: | --- |
+| fp16 panels | `pack_b_group` (`repack_panels_48x3` for `lin48`) | (none) | 2 | fp32 accumulation |
+| E4M3 codes, the caller scales | `pack_b_group_e4m3` | `b8=True` | 1 | x 2^-8 |
+| E4M3, a scale per (column, 128-K block) | `pack_b_group_bscale` | `b8, bscale` (+ `scales="single"`: the 64 B-a-strip table) | 1.03 | fully scaled |
+| GGUF Q8_0 (int8, a scale per 32) | `pack_b_group_q8` / `pack_b_group_q8f` | `b8, bscale, q8=1` (ks 8) / `q8=2` | 1.06-1.13 | fully scaled |
+| **ternary g128** ({-1, 0, +1}, a scale per (column, 128-K group)) | `pack_b_group_tern(w, scale, group, ns, ks=32)` | `b8, bscale, scales="single", tern=True` (ks 32) | 0.28 | fully scaled |
+
+**Ternary.** `w` is int8 `[N, K]` in {-1, 0, +1}, `scale` `[N, K / 128]` (fp16 values; any real scale the format carries, e.g.
+a GGUF block scale). The stream stores the 2-bit codes `c = w + 1`, four per byte across a strip's four column tiles, then the
+single-layout fp32 table `scale x 2^18` per K-slice. The kernel expands the codes into fp16 subnormal panels with byte adds and
+widening multiplies (no shifts or masks), runs the ordinary fp16 k-loop, and after it undoes the tile mixing
+(`C(j) -= C(j+1) / 4`) and the `+1` offset (a row-sum pre-pass, as Q8_0's) before the scale multiply. The codes and both
+corrections are exact (integer fp16 lanes, power-of-two steps), so C is the matrix unit's fp32 product `A_slice @ w_slice` times
+`fp32(scale)`, accumulated slice by slice in fp32, as in the E4M3 block-scaled path. Rows past N are packed as code 1 (w = 0)
+with scale 0. Against the E4M3 stream (1.03 B a weight) the ternary one moves a quarter of the bytes, and on the device the GEMM
+is bound by the expand rather than by DDR (K 5120, N 34 816, 8 rows: 5.75 ms against 8.53 ms). Any input transform the format implies (e.g. a rotation of the activations
+before a rotated-basis weight) is the caller's: it belongs in the kernel that produces A.
 
 ## Requirements
 
