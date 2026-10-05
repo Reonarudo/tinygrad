@@ -111,7 +111,7 @@ class GemmGSRunner(Runner):
   chain_member = True
   chain_cycles = False
   GSRAM = 0xF8000000
-  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING')   # read in __init__: part of the runner cache key (_cached_runner)
+  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP')   # read in __init__: part of the runner cache key (_cached_runner)
   def __init__(self, cf:UOp, device:str):
     from extra.zhouyi import kern_tpc as _KT, gemm_fp16 as _G
     self.ks, self.ns, self.nrb, self.nslices, self.ngroups, self.heads, self.a_stride, self.b_stride, self.c_stride, self.a_off, self.b_off, self.c_off, piece, self.lin48, self.rowmax, self.b8, self.bdiv = (int(x.arg) for x in cf.src[:17])
@@ -153,11 +153,12 @@ class GemmGSRunner(Runner):
     else:
       # drain="dma": GSRAM touched only between K slices (faster); ZHOUYI_GEMM_DRAIN=tec selects the TEC drain
       drain = "dma" if self.rowmax else os.environ.get("ZHOUYI_GEMM_DRAIN", "dma")
-      pf_ok = bool(self.rows) and -(-self.rows // 4) <= 2 and bool(self.b8) and bool(self.bscale) and not os.environ.get("ZHOUYI_GEMM_TIMING")   # the rows-mode prefetch path
+      pf_ok = bool(self.rows) and -(-self.rows // 4) <= 2 and bool(self.b8) and bool(self.bscale) and os.environ.get("ZHOUYI_GEMM_TIMING", "") in ("", "pfnodma")   # the rows-mode prefetch path
       assert not self.b8 or drain == "dma"
       self.text = _image.text_only(_KT.k_gemm_gs(self.ks, self.ns, self.nrbh, c_stride=self.gstride, drain=drain, rowmax=bool(self.rowmax), b8=bool(self.b8), kw=4 if self.bscale else 3, bscale=bool(self.bscale),
                                                    rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None,
-                                                   q8=self.q8 == 1, q8f=self.q8 == 2, scales=self.scales, tern=bool(self.tern)))                                    # the scale table's layout, the pack's
+                                                   q8=self.q8 == 1, q8f=self.q8 == 2, scales=self.scales, tern=bool(self.tern),
+                                                   tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst")))   # the rt-1 ternary k-loop order                                    # the scale table's layout, the pack's
       self.a_slice = self.ks * 32 * -(-self.rows // 4) if self.rows else self.nrb * self.ks * 96   # A bytes a K-slice (rows: compact)
       desc = _G.descriptors_gs(self.ks, self.ns, bool(self.rowmax), bool(self.b8), bool(self.bscale), a_bytes=self.ks * 32 * -(-self.rows // 4) if self.rows else None,
                                prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern))

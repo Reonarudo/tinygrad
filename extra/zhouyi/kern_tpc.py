@@ -3793,7 +3793,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
-              rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False):
+              rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False, tkloop="orig"):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3851,6 +3851,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # accumulated in LSRAM and scale-and-accumulate fused (acc = fp32(acc + C x s), one rounding a slice after the first); rows 9-12 and the prefill layout keep C in GSRAM with a separate multiply and add. (A duplicated
     # scale table would save the extl / exth, but they ride in the epilogue's slot-2 gaps: the same bundle count, so the
     # single layout -- ns x 64 B fewer a slice -- stays the only one.)
+    # `tkloop` (tern TF, rt 1): "orig" = the k-loop below as it was (mma and expand bundles alternating:
+    # 8 bundles a pair, every expand bundle the first vector bundle after an mma bundle); "mmfirst" = a pair's four mma
+    # bundles first, then its expand bundles (9 a pair: the first after the mmas costs 3 cycles on the board, ALU.md 7,
+    # the rest 1) -- one mma -> vector transition a pair instead of four. See strips_tf.
+    assert tkloop in ("orig", "mmfirst"), tkloop
     assert scales in ("dup", "single"), scales
     SSC = scales == "single"
     assert not tern or (b8 and bscale and SSC and not q8 and not q8f and ks % 2 == 0 and kw == 4), "k_gemm_gs(tern): b8 + bscale + scales='single'"
@@ -3869,9 +3874,12 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # (4 rt cycles) with the next step's operands in the other register set, against 24 cycles for two full row blocks.
     RT = 3 if rows is None else -(-rows // 4)
     SINGLE = rows is not None
-    assert not SINGLE or (1 <= rows <= 12 and drain == "dma" and not rowmax and not stamps and timing in (None, "dmaonly", "nodma")), "k_gemm_gs(rows): 1..12, drain=dma"
-    assert timing not in ("dmaonly", "nodma") or (SINGLE and b8), "timing dmaonly / nodma: rows mode, b8"
-    NODMA = timing == "nodma"
+    assert not SINGLE or (1 <= rows <= 12 and drain == "dma" and not rowmax and not stamps and timing in (None, "dmaonly", "nodma", "pfnodma")), "k_gemm_gs(rows): 1..12, drain=dma"
+    assert timing not in ("dmaonly", "nodma", "pfnodma") or (SINGLE and b8), "timing dmaonly / nodma: rows mode, b8"
+    # "pfnodma" (diagnostic, wrong results): the rows-mode PREFETCH path with its B / A requests
+    # and their waits dropped (the C drain kept, as "nodma" keeps it) -- the TEC-only arm of the same text the full path runs
+    # ("nodma" takes the non-prefetch path)
+    NODMA = timing in ("nodma", "pfnodma")
     def dmaq(x): return [] if NODMA else x         # a DMA request or its wait, dropped by "nodma"
     NC = 8 * RT                                    # C registers in use: t0 .. t(NC - 1)
     # rows mode reads a compact A: row block 0's RT tiles only, [slice][k][RT tiles][32 B] (AST B a k-step), so no padding
@@ -3892,7 +3900,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # Diagnostic `timing` (wrong results, timing only): "noc" skips the middle slices' GSRAM C loads/stores;
     # "gs{x}{n}" adds n GSRAM accesses of t31 at r15 per 3-k-step body (x: "l" alternating ld/st, "o" loads, "s" stores).
     # "dmaonly" / "nodma" (rows mode, diagnostics, wrong results): only the DMAs and their waits / only the expansion and compute
-    assert timing in (None, "noc", "dmaonly", "nodma") or timing[:3] in ("gsl", "gso", "gss")
+    assert timing in (None, "noc", "dmaonly", "nodma", "pfnodma") or timing[:3] in ("gsl", "gso", "gss")
     GSL = int(timing[3:]) if timing and timing[:2] == "gs" else 0
     GSK = timing[2] if GSL else None
     c_stride = nrb * CROW if c_stride is None else c_stride
@@ -3916,12 +3924,12 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     STG0 = LS.alloc("C staging 0", CROW, vld_tail=True); STG1 = LS.alloc("C staging 1", CROW, vld_tail=True)
     CBB = BH + (max(SCLB, 32 * TU) if tern else max(SCLB, 128) if V2 else SCLB)   # the codes + scales buffer: expand_v2's pipeline reads 128 B past the codes (a table under 128 B is padded)
     CB = LS.alloc("bscale: a slice's codes + scales", CBB, vld_tail=True) if bscale else STG1 + CROW
-    TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma")
+    TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma", "pfnodma")
     SPB = (256 if TF else 64) * RT                 # TF: the k-loop's starting offsets (a register a C register) instead of S'
     SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile; TF: the C start offsets)", SPB, vld_tail=True) if SP else None
     # rows mode, rt <= 2, block-scaled E4M3: the next slice's B (codes + scales, one DMA through DESC +128) and compact A are
     # requested while the current slice expands and computes. LSRAM: fp16 panels [0, 2 BH) | A x2 | one staging | B x2
-    PF = SINGLE and RT <= 2 and b8 and bscale and timing is None
+    PF = SINGLE and RT <= 2 and b8 and bscale and timing in (None, "pfnodma")
     if PF:
         LP = Lsram(f"k_gemm_gs(ks={ks}, ns={ns}, rt={RT}) prefetch")
         if not TF: LP.alloc("B panels (fp16)", ns * ks * 128, vld_tail=True)   # TF expands in the k-loop: no panels
@@ -4428,6 +4436,31 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                         KB(k_mma(4, Ab, cur["b"][2]), k_mma(6, Ab, cur["b"][3])),
                         KB(I("zipl %s.b, %s.b, t30.b" % (nxt["a"][3], ya), E.zipl(nxt["a"][3], ya, "t30")), k_mul(nxt["b"][3], ya, True),
                            k_add("r13", 64) if p == 0 else k_add("r8", 4 * AST))]
+            if tkloop == "mmfirst":
+                # A pair's mma bundles first (M0-M3, reading `cur`), then five expand bundles writing `nxt` from X (the next pair's
+                # codes): Y_j = X << 2j by independent byte shifts (no chain through ya / yb, so no 2-cycle wait between expand
+                # bundles), t30 the third Y (the zipl and its zero register are gone: all eight tiles by mul / mulh). The fifth
+                # bundle is needed because only tiles a0 / b0 come from X itself: Y_1 is ready two cycles after its shift.
+                #   M0 {mma a0, a1 ; ld Ab}  M1 {mma a2, a3}  M2 {mma b0, b1 ; ld Aa'}  M3 {mma b2, b3}
+                #   E0 {lsl y1 ; mul a0', mulh b0' (X)}  E1 {lsl y2 ; add r13 / r8}  E2 {lsl y3 ; mul a1', mulh b1' (y1)}
+                #   E3 {mul a2', mulh b2' (y2) ; ld X'}  E4 {mul a3', mulh b3' (y3)}
+                # Every `nxt` tile is rewritten >= 8 cycles after its last mma read (the previous pair's M group, then this pair's
+                # four mma bundles), and read >= 2 cycles after its rewrite (a3' at E4 -> the next M1). X' (the pair after next)
+                # loads at E3, after its last read (E2's shift), >= 8 cycles before the next E0. A: Ab at M0 (read from M2),
+                # Aa' at M2 (after M1's last read of Aa).
+                y1, y2, y3 = "t27", "t28", "t30"
+                def k_lsln(d, a, n): return I("lsl %s.b, %s.b, %d" % (d, a, n), E.vlsli(d, a, n, size="b"))
+                def part(p):
+                    cur, nxt = S_[p], S_[1 - p]; oA = 2 * AST * p
+                    return [KB(k_mma(0, Aa, cur["a"][0]), k_mma(2, Aa, cur["a"][1]), k_ld(Ab, "r8", oA + AST)),
+                            KB(k_mma(4, Aa, cur["a"][2]), k_mma(6, Aa, cur["a"][3])),
+                            KB(k_mma(0, Ab, cur["b"][0]), k_mma(2, Ab, cur["b"][1]), k_ld(Aa, "r8", oA + 2 * AST)),
+                            KB(k_mma(4, Ab, cur["b"][2]), k_mma(6, Ab, cur["b"][3])),
+                            KB(k_lsln(y1, X, 2), k_mul(nxt["a"][0], X, False), k_mul(nxt["b"][0], X, True)),
+                            KB(k_lsln(y2, X, 4), k_add("r13", 64) if p == 0 else k_add("r8", 4 * AST)),
+                            KB(k_lsln(y3, X, 6), k_mul(nxt["a"][1], y1, False), k_mul(nxt["b"][1], y1, True)),
+                            KB(k_mul(nxt["a"][2], y2, False), k_mul(nxt["b"][2], y2, True), k_ld(X, "r13", 0 if p == 0 else 32)),
+                            KB(k_mul(nxt["a"][3], y3, False), k_mul(nxt["b"][3], y3, True))]
             kb = part(0) + part(1)
             ent = {"S": S_[0], "A": [(Aa, 0)], "X": X}
         else:
@@ -4516,7 +4549,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         body += add("r9", "r12", PA0) + add("r11", "r12", PA1) + add("r20", "r12", PCB0) + add("r21", "r12", PCB1) + add("r26", "r3", 128)
         body += _mov32("r7", BH + SCLB) + [BUNDLE(I("mul r5, r4, r7", E.mul("r5", "r4", "r7")))]
         body += add("r24", "r1", 0) + add("r22", "r1", 0) + add("r17", "r0", 0)
-        body += [dma_in("zero", "r26", "r21", "r24")] + sync(1) + [dma_in("r7", "r23", "r11", "r17")]
+        body += dmaq([dma_in("zero", "r26", "r21", "r24")] + sync(1) + [dma_in("r7", "r23", "r11", "r17")])
     if TF:                         # r29 = the LSRAM accumulators; the staging rows past the rt tiles are zeros for the whole task
         body += add("r29", "r12", TACC) + [BUNDLE(I("mov4 t0, 0", E.mov4("t0", 0)))] + add("r14", "r12", TSTG)
         for s_ in range(ns):
@@ -4561,11 +4594,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         assert c_stride % CROW == 0 and (c_stride // CROW) & (c_stride // CROW - 1) == 0, "group-blocked C: c_stride a power-of-two multiple of CROW"
         def mv(d, s_): return [BUNDLE(I("add %s, %s, 0" % (d, s_), E.add(d, s_, 0)))]
         def swap(a, b_): return mv("r7", a) + mv(a, b_) + mv(b_, "r7")
-        reqB = [dma_in("zero", "r26", "r21", "r24")]
-        reqA = sync(1) + [dma_in("r7", "r23", "r11", "r17")]
+        reqB = dmaq([dma_in("zero", "r26", "r21", "r24")])
+        reqA = dmaq(sync(1) + [dma_in("r7", "r23", "r11", "r17")])
         last_block = [BUNDLE(I("sub r7, r19, r16", E.sub("r7", "r19", "r16")))]
         last_group = [BUNDLE(I("sub r7, r28, 1", E.sub("r7", "r28", 1)))]
-        step = swap("r20", "r21") + wait(0)
+        step = swap("r20", "r21") + dmaq(wait(0))
         nxt_blk = [BUNDLE(I("mul r7, r16, r5", E.mul("r7", "r16", "r5"))), BUNDLE(I("add r24, r1, r7", E.add("r24", "r1", "r7")))] + mv("r22", "r24")
         step += ifz(last_group, ifz(last_slice, ifz(last_block, [], nxt_blk + reqB), add("r22", "r22", SLB) + mv("r24", "r22") + reqB),
                     [BUNDLE(I("add r24, r24, r5", E.add("r24", "r24", "r5")))] + reqB)
@@ -4574,7 +4607,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         step += strips("r9", PSTG - BREG, scl="r20", cratio=c_stride // CROW)
         step += [BUNDLE(I("sub r28, r28, 1", E.sub("r28", "r28", 1)))]
         step.append(BUNDLE(I("cbnz r28, .Lstep", E.cbnz("r28", -len(step)))))
-        slc = mv("r28", "r16") + mv("r15", "r29") + swap("r9", "r11") + wait(1)
+        slc = mv("r28", "r16") + mv("r15", "r29") + swap("r9", "r11") + dmaq(wait(1))
         slc += ifz(last_slice, ifz(last_block, [], mv("r17", "r0") + reqA), [BUNDLE(I("add r17, r17, r6", E.add("r17", "r17", "r6")))] + reqA)
         slc += (sprep("r9") if SP else []) + step + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
         slc.append(BUNDLE(I("cbnz r18, .Lslc", E.cbnz("r18", -len(slc)))))
