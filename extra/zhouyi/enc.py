@@ -487,6 +487,12 @@ F16_BIT = 0x00010000
 def vaddf16(td, ta, tb, p="p7"): return _f3(VADDF_BASE | F16_BIT, td, ta, tb, p)
 def vsubf16(td, ta, tb, p="p7"): return _f3(VSUBF_BASE | F16_BIT, td, ta, tb, p)
 def vmulf16(td, ta, tb, p="p7"): return _f3(VMULF_BASE | F16_BIT, td, ta, tb, p)
+# fmae / fmao: fp16 x fp16 -> fp32 accumulate (td.fp32 += ta.fp16 x tb.fp16) on the even / odd fp16 lanes (fp32 lane i <- fp16
+# lane 2i / 2i + 1); oracle words (t3, t5, t9, p7) 633924a3 / 637924a3 = the fp32 fma | F16_BIT (| 1 << 22 odd) (ALU.md, "the fp16
+# vector side"; lane mapping: probed on the vendor simulator)
+FMAO_BIT = 0x00400000
+def vfmae(td, ta, tb, p="p7"): return _f3(VFMAF_BASE | F16_BIT, td, ta, tb, p)
+def vfmao(td, ta, tb, p="p7"): return _f3(VFMAF_BASE | F16_BIT | FMAO_BIT, td, ta, tb, p)
 def vrintf(td, ta, p="p7"): return _f3(VRINTF_BASE, td, ta, 0, p)
 def vscal2(td, ta, tb, p="p7"): return _f3(VSCAL2_BASE, td, ta, tb, p)
 def cvt_w_f32(td, ta): return (VEC_A, CVT_W_F32 | _vfields(td, ta))
@@ -636,6 +642,7 @@ _RS = _vfields("t3", "t5")
 SXT_BASE = {("l", "hb"): 0x045e80a3 ^ _RS, ("h", "hb"): 0x045e84a3 ^ _RS, ("l", "wh"): 0x045f00a3 ^ _RS,
             ("h", "wh"): 0x045f04a3 ^ _RS}
 UXTL_HB_BASE = 0x045e88a3 ^ _RS
+UXTH_HB_BASE = 0x045e8ca3 ^ _RS                 # btaipuas: uxth t3.h, t5.b = 045e8ca3
 
 
 def sxt(half, sizes, td, ta):
@@ -644,6 +651,7 @@ def sxt(half, sizes, td, ta):
 
 
 def uxtl_hb(td, ta): return (VEC_S, UXTL_HB_BASE | _vfields(td, ta))
+def uxth_hb(td, ta): return (VEC_S, UXTH_HB_BASE | _vfields(td, ta))   # the high 16 bytes, zero-extended to halfwords
 
 
 # insert: `insert t3.b, r5, 3` 3cce0ca3 (imm 5 bits) / `insert t3.w, r5, 3` 3cc62ca3 (imm 3 bits)

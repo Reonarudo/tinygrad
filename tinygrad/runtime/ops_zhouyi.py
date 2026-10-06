@@ -142,7 +142,9 @@ class ZhouyiAllocator(Allocator['ZhouyiDevice']):
   def _as_buffer(self, src:ZhouyiBuffer) -> memoryview:
     self.dev.raw.cache_invalidate(src)
     return to_mv(src.va, src.nbytes)
-  def _copyin(self, dest:ZhouyiBuffer, src:memoryview): ctypes.memmove(dest.va, mv_address(src), src.nbytes)
+  def _copyin(self, dest:ZhouyiBuffer, src:memoryview):
+    self.dev.raw.drain()   # a job left in flight (the graph's async tail) may read dest
+    ctypes.memmove(dest.va, mv_address(src), src.nbytes)
   def _copyout(self, dest:memoryview, src:ZhouyiBuffer):
     self.dev.raw.cache_invalidate(src)
     ctypes.memmove(mv_address(dest), src.va, dest.nbytes)
@@ -184,8 +186,14 @@ class ZhouyiProgram:
     self.launch.chain(_job_split(ntasks))
     lay = self.launch
     if _hid.LEVEL >= 2: _hid.note_params(self.dev.raw, lay.params, forget=old)   # their stamp words are poisoned before each submit
-    self.stacks, self.params, self.privs, self.chains, self.tcb_bufs = lay.stacks, lay.params, lay.privs, lay.chains, lay.tcb_bufs
+    self.stacks, self.params, self.privs = lay.stacks, lay.params, lay.privs
     self.ntasks = ntasks
+
+  # the launch's own TCB chains, built on first use (a graph's clone runs its tasks only inside the graph's chains: it has none)
+  @property
+  def chains(self): return self.launch.chains
+  @property
+  def tcb_bufs(self): return self.launch.tcb_bufs
 
   def group_slots_per_core(self) -> list:
     a = self.dev.raw.dev_addr
@@ -256,7 +264,7 @@ class ZhouyiDevice(Compiled):
       raise RuntimeError(f"ZHOUYI: {self.raw.core_cnt} cores x {self.raw.tec_cnt} TECs, expected {ZHOUYI_CORES} x {ZHOUYI_TECS}")
     from tinygrad.runtime.graph.zhouyi import ZhouyiGraph
     super().__init__(device, ZhouyiAllocator(self), [ZhouyiRenderer], functools.partial(ZhouyiProgram, self), ZhouyiGraph)
-  def synchronize(self): pass
+  def synchronize(self): self.raw.drain()   # the graphs' async tail: wait for the job left in flight
 
 # custom-op arguments `ZhouyiGraph` may fuse into its chains; `extra.zhouyi.ops` registers them
 CHAIN_MEMBER_ARGS: set[str] = set()
@@ -288,7 +296,9 @@ def barrier_group(raw) -> _dev.GroupSlot:
 
 def clone_member(prg):
   """A fresh runner for the same custom op: a chain member holds one launch state, so repeats in a graph get their own."""
-  cls, cf, device = prg._clone_args
-  r = cls(cf, device)
+  if hasattr(prg, "clone"): r = prg.clone()            # launch state of its own, the rest shared (no re-init)
+  else:
+    cls, cf, device = prg._clone_args
+    r = cls(cf, device)
   r._clone_args = prg._clone_args
   return r

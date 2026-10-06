@@ -15,13 +15,23 @@ from typing import Any, cast
 from tinygrad.device import Buffer
 from tinygrad.engine.jit import GraphRunner
 from tinygrad.engine.realize import CompiledRunner, ExecItem
-from tinygrad.helpers import all_int, getenv
+from tinygrad.helpers import all_int, getenv, ContextVar
 from tinygrad.runtime.ops_zhouyi import ZhouyiProgram, ZHOUYI_TECS, ZHOUYI_CORES, submit_wait
 from tinygrad.runtime.support.zhouyi import ZhouyiError, dev as _dev, hangid as _hid
 from tinygrad.runtime.support.zhouyi.dev import MM_TCB, TCB_LEN
 
 
 CHAIN_MAX = getenv("ZHOUYI_CHAIN_MAX", 8)   # launches per fused job (1: every launch its own job, e.g. to pin a hang to one kernel)
+# A per-capture override of CHAIN_MAX (0: none): `with Context(ZHOUYI_CHAIN_CAP=n, JIT_BATCH_SIZE=0): jit(...)` around the TinyJit call
+# that captures makes that graph's chains up to n launches (e.g. several model layers as one job) and leaves every other graph alone.
+CHAIN_CAP = ContextVar("ZHOUYI_CHAIN_CAP", 0)
+# ZHOUYI_GRAPH_OWN (default 1): each graph clones every Program / chain member it launches (see ZhouyiGraph.__init__); 0: only
+# repeats inside one graph are cloned (the launch state is shared with other graphs, so a frozen replay rewrites their params).
+OWN = getenv("ZHOUYI_GRAPH_OWN", 1) == 1
+# ZHOUYI_ASYNC (default 1, needs OWN): a frozen replay leaves its last job in flight and returns; the device's next submit, host
+# read or write, free, slot map or synchronize waits for it first (`RawDevice.drain`), so the host's work between two graph calls
+# runs under the device's. One job is on the device at a time, as before. Off under ZHOUYI_HANG_ID >= 2 (the cycle stamps).
+ASYNC = OWN and getenv("ZHOUYI_ASYNC", 1) == 1 and _hid.LEVEL < 2
 
 
 class _Frozen:
@@ -161,20 +171,24 @@ class ZhouyiGraph(GraphRunner):
     # A chain member or Program holds one launch state, so each repeat of the same runner in this graph
     # gets its own clone (members: `clone_member`; Programs: `CompiledRunner(p)`, same lib, new Launch).
     # Otherwise `plan_runs` would break the run at every repeat.
+    # OWN (default): every position gets its own clone, the first occurrence too, so no other graph (nor a plain launch) shares
+    # this graph's param buffers: a frozen replay then rewrites nothing between calls, and the next graph can be prepared while
+    # this graph's job is still running (the async tail). Otherwise layer graphs called alternately (one per weight-slot parity)
+    # rewrite each other's Programs' params on every call.
     from dataclasses import replace as _replace
     from tinygrad.runtime.ops_zhouyi import clone_member
     seen: set = set()
     for i, ji in enumerate(self.jit_cache):
       if _is_member(ji.prg) and hasattr(ji.prg, "_clone_args"):
-        if id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=clone_member(ji.prg))
+        if OWN or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=clone_member(ji.prg))
         seen.add(id(ji.prg))
-      elif isinstance(ji.prg, CompiledRunner) and self._chainable(ji) is not None:
-        if id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=CompiledRunner(ji.prg.p))
+      elif isinstance(ji.prg, CompiledRunner) and (self._chainable(ji) is not None or (OWN and isinstance(ji.prg._prg, ZhouyiProgram))):
+        if OWN or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=CompiledRunner(ji.prg.p))
         seen.add(id(ji.prg))
     prgs = [self._chainable(ji) for ji in self.jit_cache]
     # the plan: ("chain", _Chain) | ("solo", ExecItem), in launch order
     self.plan: list[tuple[str, Any]] = []
-    for run in plan_runs([id(p) if p is not None else None for p in prgs], CHAIN_MAX):
+    for run in plan_runs([id(p) if p is not None else None for p in prgs], CHAIN_CAP.value or CHAIN_MAX):
       # A lone 12-task Program is chained too. Note: as a solo launch it would be three concurrent jobs, which
       # occasionally drops one core's tasks; one job of per-core groups does not.
       lone_wide = len(run) == 1 and prgs[run[0]] is not None and not _is_member(prgs[run[0]]) and \
@@ -230,14 +244,19 @@ class ZhouyiGraph(GraphRunner):
         steps.append(("psolo", prg, ps))
       else:
         chain: _Chain = entry
-        # `_chainable` implies `_freezable` today; if not, fall back to the staged path for this chain.
-        if any(self._freezable(ji) is None for ji, _, _ in chain.items):
+        # `_chainable` implies `_freezable` for Programs today; if not, fall back to the staged path for this chain. A chain member
+        # (a GEMM runner) is not packed: each call re-runs its `stage_chain`, which rewrites nothing while its buffers are the same
+        # (a key of three addresses) -- with OWN no other graph stages it in between.
+        if any(not _is_member(prg) and self._freezable(ji) is None for ji, prg, _ in chain.items) or (not OWN and any(_is_member(p) for _, p, _ in chain.items)):
           steps.append(("chain_slow", chain))
           continue
         members = []
         for ji, prg, _ in chain.items:
+          if _is_member(prg):
+            members.append((prg, None, ji))
+            continue
           frozen_by_j[j := self._j_of[id(ji)]] = ps = self._freeze_one(ji, prg, var_vals)
-          members.append((prg, ps))
+          members.append((prg, ps, ji))
         steps.append(("chain", chain, members))
     # Poke tables: the only words that change per call. The arg array is dev_addrs then vals (in `p.vars`
     # order), so var i sits at 4*(nglobals + i); an input buffer sits at every slot `p.globals` maps to it.
@@ -331,46 +350,64 @@ class ZhouyiGraph(GraphRunner):
     _hid.log(text)
     return "\n" + text
 
-  def _run_frozen(self, input_buffers: list[Buffer], var_vals: dict[str, int]) -> None:
-    """Frozen replay: poke changed words, rewrite only stale params, then submit."""
+  def _run_frozen(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> None:
+    """Frozen replay: poke changed words, rewrite only stale params, then submit. With ASYNC every step's params are written
+    first -- while the previous graph's job may still run: this graph's launch state is its own (OWN) -- and the last job is
+    left in flight (`RawDevice.submit_async`)."""
+    raw = self._raw
+    if getattr(raw, "inflight_tag", None) is self: raw.drain()      # our own last job still running: its params are ours
     for ps, offs, input_idx in self._in_pokes:
-      ps.poke(offs, self._raw.dev_addr(input_buffers[input_idx]._buf))
+      ps.poke(offs, raw.dev_addr(input_buffers[input_idx]._buf))
     for j, i, v in self.updated_vars(var_vals):
       if (t := self._var_pokes.get((j, i))) is not None: t[0].poke(t[1], v)
-    raw = self._raw
     steps = cast(list[tuple], self._steps)
+    # 1. every step's launch state (no submit)
+    for step in steps:
+      kind = step[0]
+      if kind == "chain":
+        for prg, ps, ji in step[2]:
+          if ps is None: prg.stage_chain(ji.bufs)
+          else: ps.ensure_written(prg)
+        step[1].ensure()
+      elif kind == "psolo": step[2].ensure_written(step[1])
+      elif kind == "chain_slow":
+        self._stage_members(step[1], var_vals)
+        step[1].ensure()
+    # 2. the jobs, in order; the last one async
+    last = len(steps) - 1
+    k = 0
     try:
-      for step in steps:
+      for k, step in enumerate(steps):
         kind = step[0]
-        if kind == "chain":
-          _, chain, members = step
-          for prg, ps in members: ps.ensure_written(prg)
-          chain.ensure()
-          submit_wait(raw, [(chain.head_pa, chain.first_pa, chain.last_pa)])
+        if kind in ("chain", "chain_slow"):
+          chain = step[1]
+          sub = (chain.head_pa, chain.first_pa, chain.last_pa)
+          if ASYNC and k == last and not wait: raw.submit_async(*sub, tag=self, report=self._async_report(k))
+          else: submit_wait(raw, [sub])
         elif kind == "psolo":
           _, prg, ps = step
-          ps.ensure_written(prg)
-          submit_wait(raw, [prg._one_job()] if prg.ntasks > ZHOUYI_TECS else prg.chains)
-        elif kind == "chain_slow":
-          chain = step[1]
-          self._stage_members(chain, var_vals)
-          chain.ensure()
-          submit_wait(raw, [(chain.head_pa, chain.first_pa, chain.last_pa)])
+          subs = [prg._one_job()] if prg.ntasks > ZHOUYI_TECS else prg.chains
+          if ASYNC and k == last and not wait and len(subs) == 1: raw.submit_async(*subs[0], tag=self, report=self._async_report(k))
+          else: submit_wait(raw, subs)
         else: step[1].run(var_vals, wait=False, jit=True, do_update_stats=False)
     except ZhouyiError as e:
       if not _hid.LEVEL: raise
-      raise ZhouyiError(f"{e}{self._hang_report(next(k for k, s_ in enumerate(steps) if s_ is step), 'frozen')}") from None
+      raise ZhouyiError(f"{e}{self._hang_report(k, 'frozen')}") from None
+
+  def _async_report(self, k: int):
+    """For `RawDevice.drain`: the hang report of step `k` if the job left in flight fails (ZHOUYI_HANG_ID), else None."""
+    return (lambda: self._hang_report(k, "frozen, async: the job was left in flight and failed at a later drain")) if _hid.LEVEL else None
 
   def __call__(self, input_buffers: list[Buffer], var_vals: dict[str, int], wait=False) -> float|None:
     st = time.perf_counter()
     for (j, i), input_idx in self.input_replace.items(): self.jit_cache[j].bufs[i] = input_buffers[input_idx]
     if self._steps is not None:
-      self._run_frozen(input_buffers, var_vals)
+      self._run_frozen(input_buffers, var_vals, wait)
     else:
       self._run_staged(var_vals)
       if self._steps is None:
         self._steps = self._freeze(var_vals)
-        self._raw = next((prg.dev.raw for s in self._steps if s[0] in ("psolo", "chain")
-                          for prg in ([s[1]] if s[0] == "psolo" else [p for p, _ in s[2]])), None)
+        self._raw = next(((prg.raw if _is_member(prg) else prg.dev.raw) for s in self._steps if s[0] in ("psolo", "chain")
+                          for prg in ([s[1]] if s[0] == "psolo" else [m[0] for m in s[2]])), None)
         if self._raw is None: self._steps = None   # nothing frozen: stay on the staged loop
     return time.perf_counter() - st

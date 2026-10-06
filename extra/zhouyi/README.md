@@ -46,6 +46,12 @@ with scale 0. Against the E4M3 stream (1.03 B a weight) the ternary one moves a 
 is bound by the expand rather than by DDR (K 5120, N 34 816, 8 rows: 5.75 ms against 8.53 ms). Any input transform the format implies (e.g. a rotation of the activations
 before a rotated-basis weight) is the caller's: it belongs in the kernel that produces A.
 
+`pack_b_group_tern(..., tscale="f16")` / `gemm_gs(..., tern=True, tscale="f16")`: the same stream with the table as 16 fp16 a
+strip (`scale x 2^15`, lane 2i = column i, lane 2i + 1 = column 8 + i): 32 B instead of 64 a strip and K-slice, 2.125 bits a
+weight instead of 2.25. The kernel widens it by `fmae` / `fmao` against fp16 2^3, which gives back the fp32 table's values
+exactly, so C is bit-identical. `tern_stream_f16` converts an existing fp32-table stream (and refuses any value that is not an
+exact normal fp16, or -0); the default stays the fp32 table.
+
 ## Requirements
 
 * **Linux on the NPU's host (arm64) with the Zhouyi KMD loaded** (`/dev/aipu`). `RawDevice.cache_invalidate` relies on a

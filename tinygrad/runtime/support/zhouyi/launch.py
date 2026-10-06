@@ -10,7 +10,7 @@ param memo and the chain/param generations.
 from __future__ import annotations
 
 import ctypes, struct
-from typing import Sequence
+from typing import Sequence, cast
 
 from . import ZhouyiError
 from . import dev as _dev
@@ -36,6 +36,9 @@ STACK_BYTES, PARAM_BYTES, PRIV_BYTES = 8192, 4096, 4096
 CYCLE_STAMP_BYTES = 8
 CYCLE_STAMP_OFF = PARAM_BYTES - CYCLE_STAMP_BYTES       # 4088: start at +0, end at +4
 CYCLE_STAMP_POISON = 0xFFFFFFFF
+
+# (id(raw), text, rodata) -> (text Buffer, constant-pool Buffer): the images Launches share (Launch.__init__); never freed.
+_IMAGES: dict = {}
 
 def stack_frame_bytes(text: bytes) -> int:
   """Bytes below the TCB sp the image's kernel can use: every `sub sp, sp, imm` and `sub sp, sp, rN` (rN from the last
@@ -75,19 +78,38 @@ class Launch:
 
   def __init__(self, raw, text: bytes, rodata: bytes):
     self.raw = raw
-    self.text = raw.req_buf(len(text), MM_TEXT)
-    ctypes.memmove(self.text.va, text, len(text))
-    # `cp`, the constant pool. At least one page: every TCB carries a `cp`, even with no rodata.
-    self.cnst = raw.req_buf(max(4096, len(rodata)), MM_STATIC)
-    if rodata: ctypes.memmove(self.cnst.va, rodata, len(rodata))
+    # The image (text, constant pool) is read-only: Launches of the same image on a device that can make views (`raw.view`: the
+    # arena path below) share one copy. Fewer REQ_BUFs matter beyond memory: the slim KMD's submit finds a job's TCBs by walking
+    # every allocation of the process (`aipu_mm_v3_kva_by_pa`), ~30 ns each (measured: 20 000 buffers -> 0.6 ms a submit).
+    shared = _IMAGES.get(key := (id(raw), text, rodata)) if hasattr(raw, "view") else None
+    if shared is None:
+      self.text = raw.req_buf(len(text), MM_TEXT)
+      ctypes.memmove(self.text.va, text, len(text))
+      # `cp`, the constant pool. At least one page: every TCB carries a `cp`, even with no rodata.
+      self.cnst = raw.req_buf(max(4096, len(rodata)), MM_STATIC)
+      if rodata: ctypes.memmove(self.cnst.va, rodata, len(rodata))
+      if hasattr(raw, "view"): _IMAGES[key] = (self.text, self.cnst)
+    else: self.text, self.cnst = shared
     self.ntasks, self.ngroups, self.param_bytes = 0, 1, PARAM_BYTES
     self.widths: list[int] = []
     self.stacks: list = []
     self.params: list = []
     self.privs: list = []
-    self.tcb_bufs: list = []
-    self.chains: list = []
+    self._tcb_bufs: list = []
+    self._chains: list|None = []
+    self._chain_spec: tuple|None = None
     self.owned: list = []
+
+  # The TCB chains are built on first use: a Launch whose tasks only ever run inside a graph's fused chain (a graph's clone) never
+  # submits its own, so it never allocates them (each a TCB-type REQ_BUF the KMD walks too).
+  @property
+  def chains(self) -> list:
+    if self._chains is None: self._build_chains()
+    return cast(list, self._chains)
+  @property
+  def tcb_bufs(self) -> list:
+    if self._chains is None: self._build_chains()
+    return self._tcb_bufs
 
   def task_slots(self) -> list[TaskSlot]:
     """Every task's (sp, pp, dp), task order."""
@@ -117,24 +139,43 @@ class Launch:
     if group_widths is None and ntasks % ngroups:
       raise ZhouyiError(f"{ntasks} task(s) do not divide into {ngroups} group(s)")
     for b in self.owned: self.raw.free_buf(b)
-    a = self.raw.dev_addr
-    self.stacks = [self.raw.req_buf(stack_bytes, MM_STACK) for _ in range(ntasks)]
-    self.params = [self.raw.req_buf(param_bytes, MM_RODATA) for _ in range(ntasks)]
-    self.privs = [self.raw.req_buf(priv_bytes, MM_REUSE) for _ in range(ntasks)]
-    self.owned = [*self.stacks, *self.params, *self.privs]
+    if hasattr(self.raw, "view"):
+      # one arena for every task's stack, params and private data ([stack][params][priv] a task, each page-aligned): one REQ_BUF
+      # instead of 3 x ntasks (see __init__)
+      per = stack_bytes + param_bytes + priv_bytes
+      arena = self.raw.req_buf(per * ntasks, MM_REUSE)
+      v = self.raw.view
+      self.stacks = [v(arena, t * per, stack_bytes) for t in range(ntasks)]
+      self.params = [v(arena, t * per + stack_bytes, param_bytes) for t in range(ntasks)]
+      self.privs = [v(arena, t * per + stack_bytes + param_bytes, priv_bytes) for t in range(ntasks)]
+      self.owned = [arena]
+    else:
+      self.stacks = [self.raw.req_buf(stack_bytes, MM_STACK) for _ in range(ntasks)]
+      self.params = [self.raw.req_buf(param_bytes, MM_RODATA) for _ in range(ntasks)]
+      self.privs = [self.raw.req_buf(priv_bytes, MM_REUSE) for _ in range(ntasks)]
+      self.owned = [*self.stacks, *self.params, *self.privs]
     self._poison_stamps()
-    self.chains, self.tcb_bufs, base = [], [], 0
-    slots = self.task_slots()
-    for n in widths:
-      self.tcb_bufs.append(tcbs := self.raw.req_buf(chain_tcbs(n) * TCB_LEN, MM_TCB))
-      build_tcbs(self.raw, tcbs, spc=a(self.text), cp=a(self.cnst), ngroups=ngroups, dep=dep, grid_end=grid_end, group_widths=group_widths,
-                 tasks=slots[base:base + n])
-      self.chains.append((tcbs.pa, tcbs.pa + _dev.TASK_INDEX * TCB_LEN,
-                          tcbs.pa + (_dev.TASK_INDEX + n - 1) * TCB_LEN))
-      self.owned.append(tcbs)
-      base += n
+    self._chains, self._tcb_bufs = None, []
+    self._chain_spec = (list(widths), ngroups, dep, grid_end, group_widths)
     self.ntasks, self.widths, self.ngroups, self.param_bytes = ntasks, list(widths), ngroups, param_bytes
     return self
+
+  def _build_chains(self) -> None:
+    """The TCB chain of each job of the last `chain()` (on first use of `chains` / `tcb_bufs`)."""
+    if self._chain_spec is None: raise ZhouyiError("Launch.chain() was not called")
+    widths, ngroups, dep, grid_end, group_widths = self._chain_spec
+    a = self.raw.dev_addr
+    chains, base = [], 0
+    slots = self.task_slots()
+    for n in widths:
+      self._tcb_bufs.append(tcbs := self.raw.req_buf(chain_tcbs(n) * TCB_LEN, MM_TCB))
+      build_tcbs(self.raw, tcbs, spc=a(self.text), cp=a(self.cnst), ngroups=ngroups, dep=dep, grid_end=grid_end, group_widths=group_widths,
+                 tasks=slots[base:base + n])
+      chains.append((tcbs.pa, tcbs.pa + _dev.TASK_INDEX * TCB_LEN,
+                     tcbs.pa + (_dev.TASK_INDEX + n - 1) * TCB_LEN))
+      self.owned.append(tcbs)
+      base += n
+    self._chains = chains
 
   def _stamp_words(self, p) -> "ctypes.Array":
     return (ctypes.c_uint32 * 2).from_address(p.va + CYCLE_STAMP_OFF)

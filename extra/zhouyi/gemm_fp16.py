@@ -50,22 +50,31 @@ def unpack_c_gs(c_bytes: bytes, nrb: int, ns: int) -> np.ndarray:
 SCALE_LAYOUTS = ("dup", "single")   # the E4M3 block-scale table's layout: [s][j][c0 c1 c2 c3 c0 c1 c2 c3] (128 B a strip) / [s][j][c0 c1 c2 c3] (64 B)
 
 
-def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup") -> int:   # (tern: the single E4M3 layout, ns x 64 B)
+TERN_TSCALES = ("f32", "f16")       # the ternary stream's scale table: single-layout fp32 s x 2^18 (64 B a strip) / fp16 s x 2^15 (32 B)
+# The fp16 table's values are the fp32 table's x 2^-3 (s x 2^15); the kernel widens them by fmae against fp16 2^3. With 2^3 a
+# group scale d stored as fp16 (GGUF PTQ1_0) lands on a NORMAL fp16 for every d down to the smallest subnormal (Bonsai's fold:
+# s = d x 2^-5, so s x 2^15 = d x 2^10 >= 2^-24 x 2^10 = 2^-14) and up to d = 64; 2^15 (the prototype's "8 s") leaves d < 2^-12
+# subnormal / inexact, which Bonsai 2 27B's cache has (1972 of 2.4e8 values, e.g. L10_qkv's 0x3d3a0000 = d 93 x 2^-24).
+TERN_F16_DOWN = 3
+
+
+def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup", tscale: str = "f32") -> int:   # (tern: the single E4M3 layout, ns x 64 B)
     """A K-slice's scale table in a block-scaled gemm_gs stream: E4M3 (q8 0) [s][4 tiles][8] fp32 = 128 B a strip (`scales`
     "dup": each scale stored twice, the kernel's lane layout) or [s][4 tiles][4] fp32 = 64 B a strip ("single": each once, the
     kernel widens it); Q8_0 with the correction kernel (q8 1, ks 8) 16 fp16 a strip; Q8_0 dequantised in fp16 (q8 2) 16 fp16 a
-    strip and 32-weight block."""
-    assert scales in SCALE_LAYOUTS, scales
+    strip and 32-weight block. `tscale="f16"` (tern): 16 fp16 a strip (`pack_b_group_tern(tscale="f16")`)."""
+    assert scales in SCALE_LAYOUTS and tscale in TERN_TSCALES, (scales, tscale)
+    if tscale == "f16": return ns * 32
     return ns * (128 if scales == "dup" else 64) if not q8 else ns * 32 if q8 == 1 else ns * 32 * (ks // 8)
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
-                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False) -> bytes:
+                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False, tscale: str = "f32") -> bytes:
     """+0 the A row-block slice (`a_bytes`, default ks x 96; rows mode: the compact ks x 32 rt), +32 the B group slice (fp16, or
     the E4M3 codes with `b8`), +64 the row block's C drain (`k_gemm_gs(drain="dma")`; + its 192 B of row maxima with `rowmax`),
     +96 the slice's scale table (`bscale`, ns x 128 B, or ns x 64 B with `scales="single"`), +128 (`prefetch`: k_gemm_gs rows
-    mode) a slice's codes and scales in one (`tern`: 2-bit codes, ns x ks x 16 B)."""
-    scl = gs_scale_bytes(ns, ks, q8, scales)                                     # a slice's scale table
+    mode) a slice's codes and scales in one (`tern`: 2-bit codes, ns x ks x 16 B; `tscale`: its scale table's format)."""
+    scl = gs_scale_bytes(ns, ks, q8, scales, tscale)                                     # a slice's scale table
     ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), D.desc_words(ns * 768 + (192 if rowmax else 0))] + ([D.desc_words(scl)] if bscale else [])
     if prefetch or bscale: ws.append(D.desc_words(ns * ks * (16 if tern else 64) + scl))   # +128: a slice's codes + scales in one request
     out = bytearray(32 * len(ws))
@@ -92,12 +101,43 @@ def pack_b_group_bscale(b_e4m3: np.ndarray, scale_inv: np.ndarray, group: int, n
     return np.ascontiguousarray(np.concatenate([panels, scv], 1)).ravel()
 
 
-def pack_b_group_tern(w: np.ndarray, scale: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
+def tern_table_f16(t32: np.ndarray, ns: int) -> np.ndarray:
+    """Single-layout fp32 tables (s x 2^18; [n, ns x 64] uint8) -> the `tscale="f16"` tables ([n, ns x 32] uint8): per strip 16
+    fp16, lane 2i = column i, lane 2i + 1 = column 8 + i, the value s x 2^15 = the fp32 value x 2^-3. Raises unless EVERY value
+    converts exactly -- its fp16 finite and normal or +0 (not -0, which the kernel's 0 + fmae makes +0; not subnormal) -- so the
+    kernel's fmae / fmao against 2^15 gives back the fp32 bits and a converted stream's C is bit-identical."""
+    v = np.ascontiguousarray(t32).view(np.float32).reshape(-1, ns, 16)                  # [table][s][column 4 j + c]
+    h = (v * np.float32(2.0 ** -TERN_F16_DOWN)).astype(np.float16); hb = h.view(np.uint16)
+    back = h.astype(np.float32) * np.float32(2.0 ** TERN_F16_DOWN)
+    bad = (back.view(np.uint32) != v.view(np.uint32)) | ((hb & 0x7C00) == 0x7C00) | (((hb & 0x7C00) == 0) & (hb != 0))
+    if bad.any():
+        i = tuple(np.argwhere(bad)[0]); raise ValueError(f"tern_table_f16: {int(bad.sum())} scale(s) not exact as a normal fp16 s x 2^15 (first: table {i[0]} "
+                                                         f"strip {i[1]} column {i[2]}: fp32 {float(v[i])!r}, bits {int(v.view(np.uint32)[i]):#010x})")
+    t = h.reshape(-1, ns, 2, 8).transpose(0, 1, 3, 2)                                    # [table][s][i][half]: lane 2i + half = column 8 half + i
+    return np.ascontiguousarray(t).view(np.uint8).reshape(-1, ns * 32)
+
+
+def tern_stream_f16(stream: np.ndarray, ns: int = 3, ks: int = 32) -> np.ndarray:
+    """A `pack_b_group_tern` stream (any number of groups and slices: a run of (ns ks 16 + ns 64)-B slice records) -> the same
+    slices with `tscale="f16"` tables (ns ks 16 + ns 32 B each): the codes untouched, each table by `tern_table_f16` (exact,
+    or ValueError). Byte-identical to packing with `tscale="f16"`; the repack of an existing cache."""
+    bh, t32, t16 = ns * ks * 16, ns * 64, ns * 32
+    s = np.ascontiguousarray(stream).view(np.uint8).ravel(); assert s.size % (bh + t32) == 0, (s.size, bh + t32)
+    rec = s.reshape(-1, bh + t32)
+    out = np.empty((rec.shape[0], bh + t16), np.uint8)
+    np.copyto(out[:, :bh], rec[:, :bh]); out[:, bh:] = tern_table_f16(np.ascontiguousarray(rec[:, bh:]), ns)
+    return out.ravel()
+
+
+def pack_b_group_tern(w: np.ndarray, scale: np.ndarray, group: int, ns: int, ks: int = 32, tscale: str = "f32") -> np.ndarray:
     """Ternary g128 B `[N, K]` (int8 {-1, 0, +1}; `scale[N, K/128]` the per-column group scale, fp16 values) -> `k_gemm_gs(b8=True,
     bscale=True, scales="single", tern=True, ks=32)`'s stream for strips `group*ns .. +ns`: per K-slice (one scale group) the
     2-bit codes c = w + 1, then the single-layout fp32 table [s][j][c0 c1 c2 c3] = scale x 2^18 (64 B a strip). Codes: per strip
     and k-step pair 32 B; byte 16 h + 4 n + k (h the k-step of the pair, n / k the tile's column / k lane) holds tile j's code in
-    bits 7 - 2j : 6 - 2j (tile 0 on top). A slice is ns x ks x 16 + ns x 64 B. Rows past N: code 1 (w = 0), scale 0."""
+    bits 7 - 2j : 6 - 2j (tile 0 on top). A slice is ns x ks x 16 + ns x 64 B. Rows past N: code 1 (w = 0), scale 0.
+    `tscale="f16"` (`k_gemm_gs(tscale="f16")`): the table as 16 fp16 a strip, s x 2^15 (`tern_table_f16`: exact or ValueError), a
+    slice ns x ks x 16 + ns x 32 B; C bit-identical to the fp32 table's."""
+    assert tscale in TERN_TSCALES, tscale
     N, K = w.shape; assert 4 * ks == 128 and K % 128 == 0 and ks % 2 == 0 and scale.shape == (N, K // 128), (w.shape, scale.shape)
     r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // 128; nr = max(0, min(N, r1) - r0)
     c = np.ones((16 * ns, K), np.uint8); c[:nr] = (w[r0:r0 + nr].astype(np.int16) + 1).astype(np.uint8)
@@ -107,6 +147,7 @@ def pack_b_group_tern(w: np.ndarray, scale: np.ndarray, group: int, ns: int, ks:
     codes = (t[..., 0, :] << 6 | t[..., 1, :] << 4 | t[..., 2, :] << 2 | t[..., 3, :]).astype(np.uint8).reshape(nsl, -1)   # [slice][s q h l]
     sc = np.zeros((16 * ns, nsl), np.float32); sc[:nr] = scale[r0:r0 + nr].astype(np.float32) * np.float32(2.0 ** 18)
     scv = np.ascontiguousarray(sc.T).reshape(nsl, -1).view(np.uint8)                                   # [slice][s j c] fp32
+    if tscale == "f16": scv = tern_table_f16(scv, ns)
     return np.ascontiguousarray(np.concatenate([codes, scv], 1)).ravel()
 
 

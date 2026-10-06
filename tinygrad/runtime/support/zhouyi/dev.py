@@ -68,6 +68,12 @@ class RawDevice:
     self._job_id = 0x4660000
     # Completions dequeued by a poll that was waiting for other jobs; see `wait_jobs`.
     self._banked: dict[int, aipu.struct_aipu_job_status_desc] = {}
+    # The async tail (`submit_async`): jobs submitted and not yet waited for, the tag of their submitter and a callable that
+    # describes them if they fail. Everything that could race them -- the next submit, a host read or write of device memory, a
+    # free, a slot map -- calls `drain()` first, so one job is on the device at a time as before.
+    self.inflight: list[int] = []
+    self.inflight_tag: object = None
+    self._inflight_report = None
     if _hid.LEVEL: _hid.wrap_submit(self)    # ZHOUYI_HANG_ID: record each job's chain for the failure report (hangid.py)
 
   def __repr__(self):
@@ -105,17 +111,42 @@ class RawDevice:
     self.bufs.append(b)
     return b
 
+  def drain(self) -> None:
+    """Wait for the jobs `submit_async` left in flight (no-op when none). Single-threaded: call it from the submitting thread."""
+    if not self.inflight: return
+    ids, rep = self.inflight, self._inflight_report
+    self.inflight, self.inflight_tag, self._inflight_report = [], None, None
+    try: self.wait_jobs(ids)
+    except ZhouyiError as e:
+      if rep is None: raise
+      raise ZhouyiError(f"{e}\n{rep()}") from None
+
+  def submit_async(self, head_tcb_pa: int, first_task_tcb_pa: int, last_task_tcb_pa: int, tag: object = None, report=None) -> int:
+    """`submit` and return without waiting: the job stays in flight until the next `drain()` (which every later submit, host
+    read or write, free and slot map does). `tag`: who submitted it (`inflight_tag`); `report`: a callable whose text is added if
+    the job fails."""
+    jid = self.submit(head_tcb_pa, first_task_tcb_pa, last_task_tcb_pa)
+    self.inflight.append(jid)
+    self.inflight_tag, self._inflight_report = tag, report
+    return jid
+
+  def view(self, b: Buffer, offset: int, nbytes: int) -> Buffer:
+    """A Buffer for [offset, offset + nbytes) of allocation `b` (owns no mapping: never unmap or free it)."""
+    return Buffer(b.pa + offset, b.dev_offset + offset, nbytes, b.va + offset, b.offset + offset)
+
   def cache_invalidate(self, b: Buffer):
     """Make the device's writes to `b` visible to host reads.
 
     Invalidates the cacheable kernel linear-map alias of the buffer's pages, whose stale clean lines
     would otherwise be served to reads of the non-cacheable mapping. Note: requires the patched driver;
     in the stock driver this ioctl walks the non-cacheable alias and has no effect. `BUF_CACHE_FLUSH`
-    is not needed (the stale lines are clean).
+    is not needed (the stale lines are clean). Waits for a job left in flight first (`drain`).
     """
+    self.drain()
     aipu.AIPU_IOCTL_BUF_CACHE_INVALID(self.fd, pa=b.pa, dev_offset=b.dev_offset, bytes=b.map_bytes)
 
   def free_buf(self, b: Buffer):
+    self.drain()
     libc.munmap(b.va, b.map_bytes)
     aipu.AIPU_IOCTL_FREE_BUF(self.fd, pa=b.pa, dev_offset=b.dev_offset, bytes=b.map_bytes)
     if b in self.bufs: self.bufs.remove(b)
@@ -134,14 +165,21 @@ class RawDevice:
     """Weight memory of `nbytes` (whole 2 MiB chunks, zeroed): (id, its write-combine mapping). ENOMEM: no contiguous chunks."""
     _, wid, off = self._wslot(30, "<QQQ", nbytes, 0, 0)
     return wid, mmap.mmap(self.fd, -(-nbytes // self.WSLOT_CHUNK) * self.WSLOT_CHUNK, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=off)
-  def wbuf_free(self, wid: int): self._wslot(31, "<Q", wid, write_only=True)      # EBUSY while mmap()ed or mapped in a slot
+  def wbuf_free(self, wid: int):
+    self.drain()
+    self._wslot(31, "<Q", wid, write_only=True)      # EBUSY while mmap()ed or mapped in a slot
   def slot_alloc(self, nbytes: int) -> tuple[int, int]:
     """A 2 MiB-aligned window range with nothing mapped: (id, its NPU-view address)."""
     _, sid, pa = self._wslot(32, "<QQQ", nbytes, 0, 0)
     return sid, pa
-  def slot_free(self, sid: int): self._wslot(33, "<Q", sid, write_only=True)
-  def slot_map(self, sid: int, wid: int, offset: int, nbytes: int):
-    """Point slot `sid` at weight buffer `wid`'s [offset, offset + nbytes) (offset 2 MiB-aligned; nbytes 0 unmaps)."""
+  def slot_free(self, sid: int):
+    self.drain()
+    self._wslot(33, "<Q", sid, write_only=True)
+  def slot_map(self, sid: int, wid: int, offset: int, nbytes: int, drain: bool = True):
+    """Point slot `sid` at weight buffer `wid`'s [offset, offset + nbytes) (offset 2 MiB-aligned; nbytes 0 unmaps).
+    `drain=False`: do not wait for a job left in flight -- only when the caller knows that job does not read this slot (and
+    from a thread other than the submitting one, always)."""
+    if drain: self.drain()
     self._wslot(34, "<QQQQ", sid, wid, offset, nbytes, write_only=True)
 
   def submit(self, head_tcb_pa: int, first_task_tcb_pa: int, last_task_tcb_pa: int,
@@ -151,7 +189,9 @@ class RawDevice:
     `dbg_core` pins the job to a core. Note: `last_task_tcb_pa` must be exact (no default). The driver
     completes a job when `tail_tcbp == last_task_tcb_pa - asid0_base` and attributes interrupts by
     `first_task_tcb_pa <= tail_tcbp <= last_task_tcb_pa`; a wrong value wedges the device for the rest
-    of the process."""
+    of the process. A job left in flight by `submit_async` is waited for first: two jobs in flight run concurrently, not
+    in order (Distributing.md 4)."""
+    if self.inflight: self.drain()
     jd = aipu.struct_aipu_job_desc()
     jd.job_id, jd.aipu_arch, jd.aipu_version = self.next_job_id(), 0, self.isa_version
     jd.exec_flag = aipu.AIPU_JOB_EXEC_FLAG_QOS_SLOW | aipu.AIPU_JOB_EXEC_FLAG_MULTI_GROUP
