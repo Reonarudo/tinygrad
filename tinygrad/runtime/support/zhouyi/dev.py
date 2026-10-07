@@ -22,6 +22,11 @@ from typing import NamedTuple
 from tinygrad.runtime.autogen import aipu, libc
 from . import ZhouyiError, mapped_extent
 from . import hangid as _hid
+# The GM window (GM.md): one 4 MiB window a device (`RawDevice.gm_window`), shared by the kernel text in GM (`textgm.py`,
+# ZHOUYI_TEXT_GM, default on) and the GM-data runners (extra/zhouyi/ops.py GemmGMRunner, ZHOUYI_GM=1).
+GM_WINDOW = 4 << 20
+PAGE_BYTES = 4096
+
 MM_TEXT, MM_RODATA, MM_STACK, MM_STATIC, MM_REUSE, MM_TCB = (aipu.AIPU_MM_DATA_TYPE_TEXT, aipu.AIPU_MM_DATA_TYPE_RODATA, aipu.AIPU_MM_DATA_TYPE_STACK,
                                                              aipu.AIPU_MM_DATA_TYPE_STATIC, aipu.AIPU_MM_DATA_TYPE_REUSE, aipu.AIPU_MM_DATA_TYPE_TCB)
 TCB_LEN = 128
@@ -74,6 +79,8 @@ class RawDevice:
     self.inflight: list[int] = []
     self.inflight_tag: object = None
     self._inflight_report = None
+    # ZHOUYI_TEXT_GM (default 1): kernel text in the cluster's GM (textgm.py): where images go, which jobs run GM on, the preloads
+    self.text_gm = _textgm.TextGM(self) if _textgm.TEXT_GM else None
     if _hid.LEVEL: _hid.wrap_submit(self)    # ZHOUYI_HANG_ID: record each job's chain for the failure report (hangid.py)
 
   def __repr__(self):
@@ -84,6 +91,18 @@ class RawDevice:
     self._job_id += 1
     return self._job_id
   def dev_addr(self, b: Buffer) -> int: return b.pa - self.asid0   # every device pointer is a u32 ASID0 offset
+
+  # ***** the GM window (GM.md), and the kernel text in it (textgm.py) *****
+  def gm_window(self) -> tuple[int, int]:
+    """The device's GM window: a 4 MiB-aligned 4 MiB of IOVA, allocated once and never used as ordinary DDR (the text arena's and
+    k_gemm_gs's C regions in it, textgm.py; or a GM-data job's whole window, extra/zhouyi/ops.py). Returns (its PA, its ASID0 offset)."""
+    w = getattr(self, "_gm_win", None)
+    if w is None:
+      buf = self.req_buf(2 * GM_WINDOW, MM_REUSE)
+      pa = (buf.pa + GM_WINDOW - 1) // GM_WINDOW * GM_WINDOW
+      w = self._gm_win = (buf, pa, self.dev_addr(buf) + (pa - buf.pa))
+    return w[1], w[2]
+  _text_sync_job = None    # set by ops_zhouyi: raw -> (head, first, last, tcbs) of a one-task chain (the barrier image, in DDR)
 
   # A 16-byte vector load reads 16 bytes past its end on silicon (the simulator models exactly 16; scalar loads, 32-byte loads
   # and stores stay in bounds): at a buffer's end the overhang lands in the next page -- unmapped, the SMMU faults it and the
@@ -147,6 +166,7 @@ class RawDevice:
 
   def free_buf(self, b: Buffer):
     self.drain()
+    if self.text_gm is not None: self.text_gm.freed(b)
     libc.munmap(b.va, b.map_bytes)
     aipu.AIPU_IOCTL_FREE_BUF(self.fd, pa=b.pa, dev_offset=b.dev_offset, bytes=b.map_bytes)
     if b in self.bufs: self.bufs.remove(b)
@@ -192,6 +212,10 @@ class RawDevice:
     of the process. A job left in flight by `submit_async` is waited for first: two jobs in flight run concurrently, not
     in order (Distributing.md 4)."""
     if self.inflight: self.drain()
+    if self.text_gm is not None: self.text_gm.before_submit(head_tcb_pa)    # preload the text arena into GM, if this job needs it
+    return self._submit(head_tcb_pa, first_task_tcb_pa, last_task_tcb_pa, dbg_core)
+
+  def _submit(self, head_tcb_pa: int, first_task_tcb_pa: int, last_task_tcb_pa: int, dbg_core: int|None = None) -> int:
     jd = aipu.struct_aipu_job_desc()
     jd.job_id, jd.aipu_arch, jd.aipu_version = self.next_job_id(), 0, self.isa_version
     jd.exec_flag = aipu.AIPU_JOB_EXEC_FLAG_QOS_SLOW | aipu.AIPU_JOB_EXEC_FLAG_MULTI_GROUP
@@ -326,7 +350,7 @@ class GroupSlot(NamedTuple):
 
 def build_tcbs(dev: RawDevice, tcbs: Buffer, spc: int, tasks: list[TaskSlot], cp: int,
                ngroups: int = 1, asid1_base: int|None = None, dep=DEP_PRE_ALL,
-               grid_end: bool = False, group_widths=None) -> bytes:
+               grid_end: bool = False, group_widths=None, gm_pa: int|None = None) -> bytes:
   """Serialise a chain of groups sharing one image (`spc`/`cp`) into `tcbs`. Returns the bytes.
 
   `tasks`: one entry per task TCB, group-major; split evenly into `ngroups`, or by `group_widths`.
@@ -354,7 +378,7 @@ def build_tcbs(dev: RawDevice, tcbs: Buffer, spc: int, tasks: list[TaskSlot], cp
     per_group = len(tasks)//ngroups
     bounds = [(g*per_group, (g+1)*per_group) for g in range(ngroups)]
   return build_group_tcbs(dev, tcbs, [GroupSlot(spc, cp, list(tasks[a:b])) for a, b in bounds],
-                          asid1_base=asid1_base, dep=dep, grid_end=grid_end)
+                          asid1_base=asid1_base, dep=dep, grid_end=grid_end, gm_pa=gm_pa)
 
 
 def gm_fields(grid: bytearray|memoryview, gm_pa: int) -> None:
@@ -372,8 +396,10 @@ def build_group_tcbs(dev: RawDevice, tcbs: Buffer, groups: list[GroupSlot],
 
   `dep`: one mode for every group after the first, or a list with one entry per group (entry 0 ignored).
   For dependent kernels the mode must serialise and be a store barrier, which only DEP_PRE_ALL (the
-  default) is. `gm_pa` enables GM remap (see `gm_fields`)."""
+  default) is. `gm_pa`: the job uses GM for DATA (a GM member; see `gm_fields`). With text in GM (`dev.text_gm`, textgm.py) the
+  policy decides the GM fields: on for the text, off for a job holding a GSRAM user, on for data (its arena text then from DDR copies)."""
   if not groups or any(not g.tasks for g in groups): raise ZhouyiError("a chain needs at least one task in every group")
+  if (tg := getattr(dev, "text_gm", None)) is not None: groups, gm_pa = tg.job(tcbs, list(groups), gm_pa)
   # Barrier shape [0, 0, 0, DEP_PRE_ALL]: work groups overlap and the final trivial group waits for all of
   # them, so the chain's last TCB (on which the KMD retires the job) completes last.
   deps = list(dep) if isinstance(dep, (list, tuple)) else [dep] * len(groups)
@@ -436,3 +462,6 @@ def task_placement(tcbs: Buffer, ntasks: int) -> list[tuple[int, int, int]]:
     core, cluster, _rsvd, tec = struct.unpack_from("<HHHH", raw, 0)
     out.append((cluster, core, tec))
   return out
+
+
+from . import textgm as _textgm   # noqa: E402  (it imports this module's names)

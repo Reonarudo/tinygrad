@@ -130,10 +130,13 @@ class TestHangId(unittest.TestCase):
     old = subprocess.run(["git", "show", "HEAD~0:tinygrad/runtime/support/compiler_zhouyi.py"], cwd=here, capture_output=True, text=True).stdout
     if "_stamp" in old:   # once committed, compare with the commit before the switch
       old = subprocess.run(["git", "show", "7a238a908:tinygrad/runtime/support/compiler_zhouyi.py"], cwd=here, capture_output=True, text=True).stdout
+      if not old: self.skipTest("the reference commit 7a238a908 is not in this checkout's history")
     spec = importlib.util.spec_from_loader("old_compiler", loader=None); m = importlib.util.module_from_spec(spec); exec(old, m.__dict__)
     from tinygrad.runtime.support import compiler_zhouyi as new
     if hangid.LEVEL < 2 and new.STAMP_START == "":
-      self.assertEqual(new.VECTORS, m.VECTORS)
+      # the vector table itself changed since (one shared handler, textgm.py's arena): level 0 adds no stamp to it
+      self.assertFalse(any("209" in l for l in new.VECTORS))
+      self.assertEqual(new.VECTORS[-1], new.FP_ENABLE)
       self.assertEqual(new.epilogue(3), m.epilogue(3))
 
 if __name__ == "__main__": unittest.main()

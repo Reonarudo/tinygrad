@@ -63,6 +63,14 @@ def register_text(addr: int, name: str, **info) -> None:
   """Name the image whose text sits at device address `addr` (a Program, a runner's launch, the barrier)."""
   if addr not in _TEXTS or info: _TEXTS[addr] = dict(_TEXTS.get(addr, {}), name=name, **info)
 
+def move_text(old: int, new: int) -> None:
+  """An image's text moved (textgm.py re-packing the GM text arena): its name follows it."""
+  if (t := _TEXTS.pop(old, None)) is not None: _TEXTS[new] = t
+
+def alias_text(copy: int, of: int) -> None:
+  """`copy` holds the same image as `of` (textgm.py: a GM-data job's DDR copy of an arena image)."""
+  if (t := _TEXTS.get(of)) is not None: _TEXTS[copy] = dict(t)
+
 def note_csrc(lib: bytes, key: int) -> None: _LIBKEY[lib_id(lib)] = key
 
 def note_params(raw, params, forget=()) -> None:

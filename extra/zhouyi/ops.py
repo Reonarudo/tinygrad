@@ -8,8 +8,8 @@ from tinygrad.device import Device
 from tinygrad.dtype import dtypes
 from tinygrad.engine.realize import Runner
 from tinygrad.helpers import prod
-from tinygrad.helpers import to_mv
 from tinygrad.runtime.support.zhouyi import dev as _dev
+from tinygrad.runtime.support.zhouyi import textgm as _textgm
 from extra.zhouyi import dma
 from extra.zhouyi import image as _image
 from extra.zhouyi import timing as _timing
@@ -110,7 +110,7 @@ class GemmGSRunner(Runner):
   groups. `rawbufs` = (c, a, b)."""
   chain_member = True
   chain_cycles = False
-  GSRAM = 0xF8000000
+  GSRAM = 0xF8000000      # the C partials' home without text in GM (`textgm.gemm_c_base`)
   ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2')   # read in __init__: part of the runner cache key (_cached_runner)
   def __init__(self, cf:UOp, device:str):
     from extra.zhouyi import kern_tpc as _KT, gemm_fp16 as _G
@@ -213,6 +213,9 @@ class GemmGSRunner(Runner):
     if self._staged_key == key: return
     c, a, b = key; a += self.a_off; b += self.b_off; c += self.c_off; d = self.raw.dev_addr(self.desc)
     from extra.zhouyi import gemm_fp16 as _gfp
+    # the C partials' base per task: with text in GM (ZHOUYI_TEXT_GM, default 1: jobs run GM on, GSRAM is empty) the GM window's C
+    # region of the task (64 KiB; a TEC's vld / vst there costs what GSRAM's does, GM.md §6), else its TEC's 64 KiB of GSRAM
+    cbase = lambda t: _textgm.gemm_c_base(self.raw, t)
     bpk = 16 if self.tern else 64 if self.b8 else 128  # B bytes per strip k-step (2-bit / E4M3 codes / fp16)
     gb = self.nslices * (self.ns * self.ks * bpk + (_gfp.gs_scale_bytes(self.ns, self.ks, self.q8, self.scales, self.tscale) if self.bscale else 0))  # bytes per B group (+ the scale tables)
     for li, lay in enumerate(self.launches):
@@ -224,12 +227,12 @@ class GemmGSRunner(Runner):
             gb48 = (self.nslices // 2) * 3 * 48 * bpk
             args = (a + h * self.a_stride + pc * self.nrbh * 2304, b + (h // self.bdiv) * self.b_stride + (hf * self.ngroups + g0) * gb48,
                     c + h * self.c_stride + hf * 2304 + g0 * self.gstride + pc * self.nrbh * self.ns * 768, d, self.nslices // 2, self.nrbh, self.nrb * 48 * 96,
-                    self.GSRAM + 65536 * (t % 4), ng)
+                    cbase(t), ng)
           else:
             args = (a + h * self.a_stride + pc * self.nrbh * self.ks * 96, b + (h // self.bdiv) * self.b_stride + g0 * gb,
                     c + h * self.c_stride + g0 * self.gstride + pc * self.nrbh * self.crow, d, self.nslices, self.nrbh, self.a_slice,
-                    self.GSRAM + 65536 * (t % 4), ng)
-        else: args = (a, b, c, d, 0, self.nrbh, self.nrb * self.ks * 96, self.GSRAM, 0)  # NSLICES = 0: the task exits (barrier and spare tasks)
+                    cbase(t), ng)
+        else: args = (a, b, c, d, 0, self.nrbh, self.nrb * self.ks * 96, cbase(t % 12), 0)  # NSLICES = 0: the task exits (barrier and spare tasks)
         ctypes.memmove(lay.params[t].va, struct.pack("<9I", *args), 36)
     self._staged_key = key
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
@@ -243,15 +246,10 @@ GM_WINDOW, GM_A_CAP, GM_C_BASE, GM_C_REG = 4 << 20, 3276800, 3276800, 73728  # t
 
 
 def gm_window(raw):
-  """The device's GM window: a 4 MiB-aligned 4 MiB of IOVA, allocated once and never used as DDR.
-
-  Returns (its PA, its ASID0 offset)."""
-  w = getattr(raw, "_gm_win", None)
-  if w is None:
-    buf = raw.req_buf(2 * GM_WINDOW, MM_REUSE)
-    pa = (buf.pa + GM_WINDOW - 1) // GM_WINDOW * GM_WINDOW
-    w = raw._gm_win = (buf, pa, raw.dev_addr(buf) + (pa - buf.pa))
-  return w[1], w[2]
+  """The device's GM window (`RawDevice.gm_window`: one a device, shared with the kernel text in GM). A GM-data job owns all of it
+  while it runs: its launches are chained with `gm_pa` (textgm.py's "data" mode: the job's arena text runs from DDR copies, and
+  the arena is preloaded into GM again before the next job that fetches from it). Returns (its PA, its ASID0 offset)."""
+  return raw.gm_window()
 
 
 class GemmGMRunner(Runner):
@@ -321,8 +319,9 @@ class GemmGMRunner(Runner):
     self.launches = []
     for i in range(nl):
       name = ("stage" if i % 2 == 0 else "gemm") if self.staged else "gemm"
-      lay = Launch(self.raw, self.texts[name], b""); lay.chain([14], group_widths=[1, 4, 4, 4, 1], dep=[0, 0, 0, 0, _dev.DEP_PRE_ALL])
-      _dev.gm_fields(to_mv(lay.tcb_bufs[0].va, 128), self.gm_pa)
+      # its images in DDR (they run only in GM-data jobs, whose GM holds data); its chains GM on for data
+      lay = Launch(self.raw, self.texts[name], b"", where="ddr")
+      lay.chain([14], group_widths=[1, 4, 4, 4, 1], dep=[0, 0, 0, 0, _dev.DEP_PRE_ALL], gm_pa=self.gm_pa)
       self.launches.append((name, lay))
     self._chain_gen = 0
     self._staged_key = None

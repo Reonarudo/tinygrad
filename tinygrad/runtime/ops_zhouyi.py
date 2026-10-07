@@ -284,6 +284,16 @@ _BARRIER_TEXT = bytes.fromhex(
 )
 
 _BARRIERS: dict = {}
+_SYNC: dict = {}
+
+def _text_sync_job(raw):
+  """Text in GM (textgm.py): a one-task chain of the barrier image, for `TextGM.preload` to put SYNC_TO_GM in its grid TCB. Its
+  image is in DDR: it runs while GM does not yet hold the arena."""
+  if (j := _SYNC.get(id(raw))) is None:
+    lay = Launch(raw, _BARRIER_TEXT, b"", where="ddr"); lay.chain([1])
+    pa = lay.chains[0]; j = _SYNC[id(raw)] = (*pa, lay.tcb_bufs[0], lay)
+  return j[:4]
+_dev.RawDevice._text_sync_job = staticmethod(_text_sync_job)
 
 def barrier_group(raw) -> _dev.GroupSlot:
   if (lay := _BARRIERS.get(id(raw))) is None:

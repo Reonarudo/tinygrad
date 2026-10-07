@@ -19,7 +19,7 @@ class TestRunnerCache(unittest.TestCase):
     finally: os.environ.pop("ZHOUYI_TEST_KNOB", None)
     self.assertIsNot(a, b); self.assertEqual((a.knob, b.knob), (None, "tec")); self.assertIs(a, c)
   def test_declared_keys(self):
-    self.assertEqual(set(OA.GemmGSRunner.ENV_KEYS), {"ZHOUYI_GEMM_DRAIN", "ZHOUYI_GEMM_TIMING"})
+    self.assertEqual(set(OA.GemmGSRunner.ENV_KEYS), {"ZHOUYI_GEMM_DRAIN", "ZHOUYI_GEMM_TIMING", "ZHOUYI_TERN_KLOOP", "ZHOUYI_TERN_KLOOP2"})
     self.assertEqual(tuple(getattr(OA.GemmGMRunner, "ENV_KEYS", ())), ())
 
 if __name__ == "__main__": unittest.main()

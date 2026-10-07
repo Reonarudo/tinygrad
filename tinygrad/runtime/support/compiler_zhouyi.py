@@ -30,19 +30,21 @@ def _run(tool:str, args:list[str]):
   if (rc := getattr(toolchain_lib(), tool)(len(argv), (ctypes.c_char_p * (len(argv)+1))(*[a.encode() for a in argv], None))) != 0:
     raise CompileError(f"ZHOUYI: {tool} returned {rc}")
 
-# The image: slot 0 of a 16-entry vector table branches to main; every other slot (an exception) records its vector number in
-# the task's private buffer (word 0; the TCB pointer comes from ctrl0[20] as in the kernel prologue, the loaded register is used
-# only PAD bundles later since the load latency is exposed), writes the data cache back and spins -- a timed-out job can then
-# say which exception each task took (`ZhouyiProgram.__call__`). Note: a memory access that never completes is NOT an
-# exception: it presents as a hang with no vector recorded. Main enables the fp units (without it every vector instruction
-# traps), runs the kernel, and each `br ra` becomes the vendor's task epilogue: flush the data cache, wait for it, exit.
+# The image: slot 0 of a 16-entry vector table branches to main; every other slot k (an exception) is ONE bundle -- `mov r3, k` beside
+# a branch to the shared handler, which records the vector number in the task's private buffer (word 0; the TCB pointer comes from
+# ctrl0[20] as in the kernel prologue, the loaded register is used only PAD bundles later since the load latency is exposed), writes
+# the data cache back and spins -- a timed-out job can then say which exception each task took (`ZhouyiProgram.exception_vectors`).
+# 46 bundles (736 B) before main, where one handler per vector took 452 (7.2 KB, most of a small kernel's image: textgm.py's GM
+# text arena holds the images). Note: a memory access that never completes is NOT an exception: it presents as a hang with no
+# vector recorded. Main enables the fp units (without it every vector instruction traps), runs the kernel, and each `br ra` becomes
+# the vendor's task epilogue: flush the data cache, wait for it, exit.
 FP_ENABLE = ("\t{ mfctrl1 r9, 2; }\n\t{ bfs r9, r9, 31, 0; }\n\t{ mtctrl1 r9, 2; }\n"
              "\t{ mfctrl1 r9, 0x10; }\n\t{ bfs r9, r9, 31, 0; }\n\t{ mtctrl1 r9, 0x10; }")
 PAD = 8
 FLUSH = ["\t{ mfctrl0 r2, 0x82; }", "\t{ orl r2, r2, 4; }", "\t{ mtctrl0 r2, 0x82; }", "\t{ mfctrl0 r3, 0x90; }", "\t{ movh r3, 381; }", "\t{ mtctrl0 r3, 0x90; }"]
-def _vector(k:int) -> list[str]:
-  return [f".Lvec{k}:", "\t{ mfctrl0 r2, 20; }", *[f"\t{{ mov r3, {k}; }}"] * PAD, "\t{ ld r2, [r2+60]; }", *[f"\t{{ mov r3, {k}; }}"] * PAD,
-          "\t{ st r3, [r2+0]; }", *FLUSH, f".Lmf{k}:", "\t{ mfctrl0 r2, 0x82; }", "\t{ andl r2, r2, 4; }", f"\t{{ cbnz r2, .Lmf{k}; }}", "\t{ b .Lhang; }"]
+# the shared handler (r3 = the vector number, set by the slot): r3 is not touched until its store
+HANDLER = [".Lexc:", "\t{ mfctrl0 r2, 20; }", *["\t{ nop; }"] * PAD, "\t{ ld r2, [r2+60]; }", *["\t{ nop; }"] * PAD,
+           "\t{ st r3, [r2+0]; }", *FLUSH, ".Lmf:", "\t{ mfctrl0 r2, 0x82; }", "\t{ andl r2, r2, 4; }", "\t{ cbnz r2, .Lmf; }", "\t{ b .Lhang; }"]
 # ZHOUYI_HANG_ID=2 (hangid.py): the TEC cycle counter (ctrl0[0xd1]) into word `slot` of the task's param tail (pp + CYCLE_STAMP_OFF):
 # slot 0 after the fp enable, slot 1 before each task epilogue (whose writeback lands it in DDR). r2/r3 as the epilogue and the
 # vectors use them, r9 (the fp enable's scratch) as padding: like the vectors, every loaded or control-read value is used only PAD
@@ -56,8 +58,9 @@ def epilogue(n:int) -> str:
   return STAMP_END + (f"{{ mfctrl0 r2, 0x82; }}\n\t{{ orl r2, r2, 4; }}\n\t{{ mtctrl0 r2, 0x82; }}\n\t{{ mfctrl0 r3, 0x90; }}\n\t{{ movh r3, 381; }}\n\t"
           f"{{ mtctrl0 r3, 0x90; }}\n\t.Lflush{n}:\n\t{{ mfctrl0 r2, 0x82; }}\n\t{{ andl r2, r2, 4; }}\n\t{{ cbnz r2, .Lflush{n}; }}\n\t"
           "{ wfe r0, 0; }\n\t{ exit; }")
-VECTORS = ["\t.text", "\t.globl _entry", "\t.p2align 4", "_entry:", "\t{ b .Lmain; }"] + [f"\t{{ b .Lvec{k}; }}" for k in range(1, 16)] + \
-          [".Lhang:", "\t{ b .Lhang; }"] + [l for k in range(1, 16) for l in _vector(k)] + [".Lmain:", FP_ENABLE] + ([STAMP_START] if STAMP_START else [])
+VECTORS = ["\t.text", "\t.globl _entry", "\t.p2align 4", "_entry:", "\t{ b .Lmain; }"] + [f"\t{{ mov r3, {k}; b .Lexc; }}" for k in range(1, 16)] + \
+          [".Lhang:", "\t{ b .Lhang; }"] + HANDLER + [".Lmain:", FP_ENABLE] + ([STAMP_START] if STAMP_START else [])
+VECTOR_BUNDLES = 16 + 1 + len([l for l in HANDLER if l.startswith("\t{")])   # bundles before main (46): never executed but on a fault
 # directives irrelevant to a bare-metal image; `.section` must stay, or the constant pool would be assembled into `.text`
 DROP = (".file", ".ident", ".globl", ".type", ".size")
 

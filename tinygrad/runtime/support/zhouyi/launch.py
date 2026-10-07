@@ -76,15 +76,21 @@ class Launch:
   stand-in (which replaces the kernel driver, so it does not exercise it).
   """
 
-  def __init__(self, raw, text: bytes, rodata: bytes):
+  def __init__(self, raw, text: bytes, rodata: bytes, gsram: bool|None = None, where: str = "auto"):
+    """`gsram`: True for an image that uses GSRAM through an address it is given at run time (the text scan cannot see it), False
+    to vouch that it does not; None: the scan decides (dev.text_gm, textgm.py). `where="ddr"`: never in the GM text arena (an
+    image that only runs in GM-data jobs, or the arena's own preload job)."""
     self.raw = raw
     # The image (text, constant pool) is read-only: Launches of the same image on a device that can make views (`raw.view`: the
     # arena path below) share one copy. Fewer REQ_BUFs matter beyond memory: the slim KMD's submit finds a job's TCBs by walking
     # every allocation of the process (`aipu_mm_v3_kva_by_pa`), ~30 ns each (measured: 20 000 buffers -> 0.6 ms a submit).
-    shared = _IMAGES.get(key := (id(raw), text, rodata)) if hasattr(raw, "view") else None
+    shared = _IMAGES.get(key := (id(raw), text, rodata, gsram, where)) if hasattr(raw, "view") else None
     if shared is None:
-      self.text = raw.req_buf(len(text), MM_TEXT)
-      ctypes.memmove(self.text.va, text, len(text))
+      # with text in GM (raw.text_gm, ZHOUYI_TEXT_GM default 1) the policy places the image (the GM window's text arena, or DDR)
+      if (tg := getattr(raw, "text_gm", None)) is not None: self.text = tg.place(text, gsram=gsram, where=where)
+      else:
+        self.text = raw.req_buf(len(text), MM_TEXT)
+        ctypes.memmove(self.text.va, text, len(text))
       # `cp`, the constant pool. At least one page: every TCB carries a `cp`, even with no rodata.
       self.cnst = raw.req_buf(max(4096, len(rodata)), MM_STATIC)
       if rodata: ctypes.memmove(self.cnst.va, rodata, len(rodata))
@@ -119,11 +125,13 @@ class Launch:
 
   def chain(self, widths: Sequence[int], *, ngroups: int = 1, stack_bytes: int = STACK_BYTES,
             param_bytes: int = PARAM_BYTES, priv_bytes: int = PRIV_BYTES,
-            dep=_dev.DEP_PRE_ALL, grid_end: bool = False, group_widths=None) -> "Launch":
+            dep=_dev.DEP_PRE_ALL, grid_end: bool = False, group_widths=None, gm_pa: int|None = None) -> "Launch":
     """Allocate the per-task buffers and build one TCB chain per entry of `widths`.
 
     `widths`: tasks per job, e.g. `[4]` for one core, `[4,4,4]` for three. Each job is a separate
     `SCHEDULE_JOB` with its own head, SegMMU pair and task TCBs; stacks/params/privs are one per task.
+
+    `gm_pa`: every job of this launch uses GM for data (the window `raw.gm_window()`; GM.md, textgm.py's "data" mode).
 
     `ngroups` (groups per job) is not `len(widths)`; the default 1 is the shipping configuration. With
     several groups, dep mode 0 can report DONE with work unfinished and non-zero modes serialise the
@@ -156,21 +164,21 @@ class Launch:
       self.owned = [*self.stacks, *self.params, *self.privs]
     self._poison_stamps()
     self._chains, self._tcb_bufs = None, []
-    self._chain_spec = (list(widths), ngroups, dep, grid_end, group_widths)
+    self._chain_spec = (list(widths), ngroups, dep, grid_end, group_widths, gm_pa)
     self.ntasks, self.widths, self.ngroups, self.param_bytes = ntasks, list(widths), ngroups, param_bytes
     return self
 
   def _build_chains(self) -> None:
     """The TCB chain of each job of the last `chain()` (on first use of `chains` / `tcb_bufs`)."""
     if self._chain_spec is None: raise ZhouyiError("Launch.chain() was not called")
-    widths, ngroups, dep, grid_end, group_widths = self._chain_spec
+    widths, ngroups, dep, grid_end, group_widths, gm_pa = self._chain_spec
     a = self.raw.dev_addr
     chains, base = [], 0
     slots = self.task_slots()
     for n in widths:
       self._tcb_bufs.append(tcbs := self.raw.req_buf(chain_tcbs(n) * TCB_LEN, MM_TCB))
       build_tcbs(self.raw, tcbs, spc=a(self.text), cp=a(self.cnst), ngroups=ngroups, dep=dep, grid_end=grid_end, group_widths=group_widths,
-                 tasks=slots[base:base + n])
+                 tasks=slots[base:base + n], gm_pa=gm_pa)
       chains.append((tcbs.pa, tcbs.pa + _dev.TASK_INDEX * TCB_LEN,
                      tcbs.pa + (_dev.TASK_INDEX + n - 1) * TCB_LEN))
       self.owned.append(tcbs)
