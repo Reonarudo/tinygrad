@@ -111,7 +111,7 @@ class GemmGSRunner(Runner):
   chain_member = True
   chain_cycles = False
   GSRAM = 0xF8000000      # the C partials' home without text in GM (`textgm.gemm_c_base`)
-  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2')   # read in __init__: part of the runner cache key (_cached_runner)
+  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2', 'ZHOUYI_GEMM_KLOOP')   # read in __init__: part of the runner cache key (_cached_runner)
   def __init__(self, cf:UOp, device:str):
     from extra.zhouyi import kern_tpc as _KT, gemm_fp16 as _G
     self.ks, self.ns, self.nrb, self.nslices, self.ngroups, self.heads, self.a_stride, self.b_stride, self.c_stride, self.a_off, self.b_off, self.c_off, piece, self.lin48, self.rowmax, self.b8, self.bdiv = (int(x.arg) for x in cf.src[:17])
@@ -162,7 +162,9 @@ class GemmGSRunner(Runner):
                                                    rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None,
                                                    q8=self.q8 == 1, q8f=self.q8 == 2, scales=self.scales, tern=bool(self.tern),
                                                    tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst"), tscale=self.tscale,   # the rt-1 ternary k-loop order
-                                                   tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w")))   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
+                                                   tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w"),   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
+                                                   # the Q8_0 (q8 1) rows-mode strip loop and expand, scheduled (orig = the old order)
+                                                   gkloop=os.environ.get("ZHOUYI_GEMM_KLOOP", "sched") if self.q8 == 1 and self.rows else "orig"))
       self.a_slice = self.ks * 32 * -(-self.rows // 4) if self.rows else self.nrb * self.ks * 96   # A bytes a K-slice (rows: compact)
       desc = _G.descriptors_gs(self.ks, self.ns, bool(self.rowmax), bool(self.b8), bool(self.bscale), a_bytes=self.ks * 32 * -(-self.rows // 4) if self.rows else None,
                                prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern), tscale=self.tscale)
