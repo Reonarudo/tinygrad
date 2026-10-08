@@ -111,7 +111,7 @@ class GemmGSRunner(Runner):
   chain_member = True
   chain_cycles = False
   GSRAM = 0xF8000000      # the C partials' home without text in GM (`textgm.gemm_c_base`)
-  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2', 'ZHOUYI_GEMM_KLOOP')   # read in __init__: part of the runner cache key (_cached_runner)
+  ENV_KEYS = ('ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2', 'ZHOUYI_GEMM_KLOOP', 'ZHOUYI_GEMM_CDRAIN')   # read in __init__: part of the runner cache key (_cached_runner)
   def __init__(self, cf:UOp, device:str):
     from extra.zhouyi import kern_tpc as _KT, gemm_fp16 as _G
     self.ks, self.ns, self.nrb, self.nslices, self.ngroups, self.heads, self.a_stride, self.b_stride, self.c_stride, self.a_off, self.b_off, self.c_off, piece, self.lin48, self.rowmax, self.b8, self.bdiv = (int(x.arg) for x in cf.src[:17])
@@ -166,8 +166,12 @@ class GemmGSRunner(Runner):
                                                    # the Q8_0 (q8 1) rows-mode strip loop and expand, scheduled (orig = the old order)
                                                    gkloop=os.environ.get("ZHOUYI_GEMM_KLOOP", "sched") if self.q8 == 1 and self.rows else "orig"))
       self.a_slice = self.ks * 32 * -(-self.rows // 4) if self.rows else self.nrb * self.ks * 96   # A bytes a K-slice (rows: compact)
+      # rows mode at rt <= 2 drains only the rt live row tiles of each strip (ZHOUYI_GEMM_CDRAIN=full: the whole 12-row
+      # block, the rows past them as zeros -- the old drain); C's rows past the rt tiles are then left as they were
+      rt = -(-self.rows // 4) if self.rows else 0
+      self.c_rt = rt if 1 <= rt <= 2 and os.environ.get("ZHOUYI_GEMM_CDRAIN", "live") != "full" else None
       desc = _G.descriptors_gs(self.ks, self.ns, bool(self.rowmax), bool(self.b8), bool(self.bscale), a_bytes=self.ks * 32 * -(-self.rows // 4) if self.rows else None,
-                               prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern), tscale=self.tscale)
+                               prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern), tscale=self.tscale, c_rt=self.c_rt)
     self.desc = self.raw.req_buf(len(desc), MM_REUSE); ctypes.memmove(self.desc.va, desc, len(desc))
     # Plan: (head, piece, g0, ng) per task. Groups are split into r runs, with r chosen so tasks fill 12-task
     # launches with the least idle work (each launch waits for its slowest task).
@@ -215,6 +219,12 @@ class GemmGSRunner(Runner):
     if self._staged_key == key: return
     c, a, b = key; a += self.a_off; b += self.b_off; c += self.c_off; d = self.raw.dev_addr(self.desc)
     from extra.zhouyi import gemm_fp16 as _gfp
+    if self.raw.text_gm is not None:   # A in the GM window's A staging buffer (gemm_a_gm): rows mode only, and all of it inside
+      lo, hi = _textgm.gemm_a_region(self.raw)
+      if lo <= a < hi:
+        assert self.rows, f"{self.display_name}: A in the GM A staging buffer, but not rows mode (the full-layout A stays in DDR)"
+        top = a + (self.heads - 1) * self.a_stride + self.nslices * self.a_slice
+        assert top <= hi, f"{self.display_name}: A [{a:#x}, {top:#x}) runs past the GM A staging buffer's end {hi:#x}"
     # the C partials' base per task: with text in GM (ZHOUYI_TEXT_GM, default 1: jobs run GM on, GSRAM is empty) the GM window's C
     # region of the task (64 KiB; a TEC's vld / vst there costs what GSRAM's does, GM.md §6), else its TEC's 64 KiB of GSRAM
     cbase = lambda t: _textgm.gemm_c_base(self.raw, t)
@@ -242,6 +252,28 @@ class GemmGSRunner(Runner):
     st = time.perf_counter()
     for lay in self.launches: _timing.submit_and_wait(self.raw, lay.chains)
     return time.perf_counter() - st if wait else None
+
+
+def gemm_a_gm(n:int, dtype=dtypes.uint16, device:str|None=None):
+  """The rows-mode GEMMs' A staging buffer in GM: a Tensor of `n` elements of `dtype` over the GM window's A region
+  (textgm.GEMM_A_OFF, 512 KiB), or None when it cannot serve -- text not in GM (ZHOUYI_TEXT_GM=0: no GM-on jobs), GM-data GEMMs
+  (ZHOUYI_GM=1), ZHOUYI_GEMM_AGM=0, or `n` elements past its capacity. A producer kernel that writes a rows-mode `gemm_gs`'s A
+  (compact layout) into it -- by DMA, or by its stores: every path to a window address is GM -- has the GEMM read A from GM (off the
+  DDR port) instead of DDR.
+
+  ONE region for every caller: every Tensor returned aliases the same bytes. It holds a value from its producer to the GEMMs that read
+  it, across jobs (GM persists; the arena's preloads stop below it), provided nothing else writes it in between: give it only to A
+  operands each consumed by the GEMMs right after its producer (a layer's qkv / o / gate|up / down inputs; a head's parts). No
+  host access (no mapping: the bytes live in GM). The non-rows (full-layout) A and GM-off jobs keep A in DDR: GemmGSRunner refuses
+  a non-rows A in the region, and once one is handed out a GM-off or GM-data job is refused (textgm.TextGM.job). Frozen graphs keep
+  the address, so the choice is made once, when the caller allocates its buffer."""
+  dev = Device[device or Device.DEFAULT]; raw = dev.raw
+  tg = raw.text_gm
+  if tg is None or os.environ.get("ZHOUYI_GEMM_AGM", "1") != "1" or os.environ.get("ZHOUYI_GM", "0") == "1": return None
+  if n * dtype.itemsize > _textgm.GEMM_A_CAP: return None
+  from tinygrad.tensor import Tensor
+  tg.arm_a()
+  return Tensor.from_blob(raw.gm_window()[0] + _textgm.GEMM_A_OFF, (n,), dtype=dtype, device=dev.device)
 
 
 GM_WINDOW, GM_A_CAP, GM_C_BASE, GM_C_REG = 4 << 20, 3276800, 3276800, 73728  # the window; A chunks below GM_A_CAP; 12 C regions above
@@ -502,7 +534,8 @@ def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:in
       bit-identical). The pack's marker decides (the caller passes it here).
     rows (1..12, one row piece): only the first `rows` rows are computed (decode). A is then the compact layout
       [slice][k][rt tiles][32 B] (rt = ceil(rows / 4): the decode producers write it; no padding crosses DDR); C keeps
-      its layout, the other rows zeros in row block 0 and untouched elsewhere.
+      its layout: row block 0's first rt row tiles (rows 0 .. 4 rt - 1) are written, everything else is left untouched
+      (rows 9-12, rt 3: the whole row block 0; ZHOUYI_GEMM_CDRAIN=full: rt <= 2 too, the rows past the rt tiles as zeros).
     tern (bscale, scales="single"): `b` is `pack_b_group_tern`'s stream -- ternary g128 weights as 2-bit codes (16 B a strip
       k-step) + the per-(column, slice) scale table; C comes out fully scaled.
     tscale (tern): the stream's scale table -- "f32" (`pack_b_group_tern`'s default: single-layout fp32 s x 2^18, 64 B a strip

@@ -3892,7 +3892,8 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     assert not bscale or (b8 and drain == "dma" and not rowmax and not stamps), "k_gemm_gs(bscale): b8, drain=dma"
     # `rows` (decode: few real rows): only row block 0's first `rows` rows are computed -- rt = ceil(rows / 4) row tiles, one
     # row block, no row-block pairing. The layouts are unchanged (A over nrb blocks, C over nrb blocks); C rows past the rt
-    # tiles are drained as zeros, the other row blocks' C is never written. For rt <= 2 the k-step is 2 rt `mma` bundles
+    # tiles are staged as zeros and reach C only with a full drain request (the runner's rt <= 2 descriptor carries the rt tiles
+    # alone: descriptors_gs(c_rt=)); the other row blocks' C is never written. For rt <= 2 the k-step is 2 rt `mma` bundles
     # (4 rt cycles) with the next step's operands in the other register set, against 24 cycles for two full row blocks.
     RT = 3 if rows is None else -(-rows // 4)
     SINGLE = rows is not None

@@ -14,7 +14,8 @@ on the board: 64-B lines, no prefetch, one I-cache a core shared by its 4 TECs).
     kernels are the ones in GM. `stats` counts everything; DEBUG >= 1 (or ZHOUYI_TEXT_GM_DEBUG=1) prints when the arena fills and
     re-packs, and the summary (`repr`) at exit.
   * **Window layout** (one window a device, `RawDevice.gm_window`):
-        [0, 3 MiB)          the text arena
+        [0, 2.5 MiB)        the text arena (every model's decode text measured 0.5-1.5 MB)
+        [2.5, 3 MiB)        the rows-mode GEMMs' A staging buffer (`gemm_a_region`, ops.gemm_a_gm; ZHOUYI_GEMM_AGM=0: none)
         [3, 3.75 MiB)       k_gemm_gs's C partials, 64 KiB a task (`gemm_c_base`; GSRAM is empty in a GM-on job)
         [0, 4 MiB)          a GM-DATA job's (`GemmGMRunner`, ZHOUYI_GM=1): A chunks and C regions over the whole window
   * **Job modes**, decided per chain in `build_group_tcbs` (`job`):
@@ -24,6 +25,12 @@ on the board: 64-B lines, no prefetch, one I-cache a core shared by its 4 TECs).
         data  GM on for data (a GM member, `gm_pa`): the data owns all of GM, so every arena image of the job runs from its DDR
               home (`_ddr_addr`: the same bytes), and after the job GM no longer holds the arena -- the next text job preloads it.
     A job holding both a GSRAM user and a GM-data member is refused (ZhouyiError): it cannot be right either way.
+  * **The A staging buffer**: a rows-mode GEMM's A operand written by its producer kernel into the window's A region
+    (`gemm_a_region`) is read by the GEMM's A requests from GM (~120 GB/s, off the 24 GB/s DDR port) instead of DDR. It is ONE
+    region shared by every caller, valid from its producer to the GEMMs that read it: GM persists across jobs and preloads touch
+    only the arena, so it holds while every job between them is a text job. Once the region has been handed out (`arm_a`) a job
+    that would run GM off (a GSRAM user) or GM-data is refused (ZhouyiError): the region's writes and reads would land in different
+    memories (GM vs the window's DDR backing).
   * **GSRAM users** are marked: by a static scan of the image (`gsram_refs`: a `movh` of a GSRAM high half 0xF800..0xF803, or a
     `dma` with a GSRAM end), or by the caller (`Launch(..., gsram=True)`: an image that gets a GSRAM address at run time). A marked
     image never enters the arena and every job holding it runs GM off. The one production user, k_gemm_gs's C partials (an
@@ -42,14 +49,15 @@ from .dev import Buffer, TCB_LEN, TASK_INDEX, T_SPC, MM_TEXT, PAGE_BYTES, GM_WIN
 
 TEXT_GM = os.environ.get("ZHOUYI_TEXT_GM", "1") == "1"
 GEMM_C_OFF, GEMM_C_REG, GEMM_C_TASKS = 3 << 20, 65536, 12        # k_gemm_gs's C regions: 12 x 64 KiB from 3 MiB (to 3.75 MiB)
-TEXT_GM_CAP = int(os.environ.get("ZHOUYI_TEXT_GM_CAP", str(GEMM_C_OFF)), 0)   # the arena's size (a smaller one: tests of the full arena)
+GEMM_A_OFF, GEMM_A_CAP = 5 << 19, 1 << 19                          # the rows-mode GEMMs' A staging buffer: [2.5, 3 MiB) (rows 9-12 at K 17408: 417792 B)
+TEXT_GM_CAP = int(os.environ.get("ZHOUYI_TEXT_GM_CAP", str(GEMM_A_OFF)), 0)   # the arena's size (a smaller one: tests of the full arena)
 TEXT_GM_ALIGN = 256
 RANK = os.environ.get("ZHOUYI_TEXT_GM_RANK", "1") == "1"           # re-pack a full arena by launch counts (0: first come, first placed)
 RANK_FIRST, RANK_GROWTH = 64, 4                                    # re-pack after 64 text jobs counted full, then 256, 1024, ... (x4)
 PROMOTE_QUIET, PROMOTE_MAX = 4, 64                                 # promote new images after 4 jobs without a new one, or 64 jobs
 DEBUG = int(os.environ.get("ZHOUYI_TEXT_GM_DEBUG", os.environ.get("DEBUG", "0")) or 0)
 GSRAM_LO, GSRAM_HI = 0xF8000000, 0xF8040000                         # GSRAM: 256 KiB a core (GSRAM.md)
-assert 0 < TEXT_GM_CAP <= GEMM_C_OFF and GEMM_C_OFF + GEMM_C_TASKS * GEMM_C_REG <= GM_WINDOW
+assert 0 < TEXT_GM_CAP <= GEMM_A_OFF and GEMM_A_OFF + GEMM_A_CAP <= GEMM_C_OFF and GEMM_C_OFF + GEMM_C_TASKS * GEMM_C_REG <= GM_WINDOW
 SYNC_TO_GM = 1 << 30
 
 
@@ -88,6 +96,12 @@ def gemm_c_base(raw, t: int) -> int:
     assert 0 <= t < GEMM_C_TASKS, t
     return raw.gm_window()[1] + GEMM_C_OFF + GEMM_C_REG * t
   return GSRAM_LO + 65536 * (t % 4)
+
+
+def gemm_a_region(raw) -> tuple[int, int]:
+  """The A staging buffer's [lo, hi) device addresses in the GM window (the region is the same whether or not it is in use)."""
+  w = raw.gm_window()[1] + GEMM_A_OFF
+  return w, w + GEMM_A_CAP
 
 
 # ***************** the bookkeeping *****************
@@ -129,6 +143,7 @@ class TextGM:
     self.fresh = 0                      # images never promoted
     self.since_new = self.since_promote = 0
     self.counted, self.next_rank = 0, RANK_FIRST
+    self.a_armed = False                # the A staging buffer handed out (`arm_a`): GM-off and GM-data jobs refused from then on
     self.stats = dict(arena_images=0, arena_bytes=0, ddr_images=0, ddr_bytes=0, fixed_images=0, gsram_images=0, text_jobs=0, off_jobs=0,
                       data_jobs=0, unknown_jobs=0, promotions=0, preloads=0, preload_pages=0, preload_s=0.0, ranks=0, moved=0, data_copies=0)
     if DEBUG >= 1:
@@ -188,6 +203,16 @@ class TextGM:
     self.stats["data_copies"] += 1
     return self.raw.dev_addr(im.home)
 
+  def arm_a(self) -> None:
+    """The A staging buffer is in use: from now on every job must run GM on for text (`job` refuses the others)."""
+    if not self.a_armed: self._say("the GEMMs' A staging buffer is in use: GM-off and GM-data jobs are refused from now on")
+    self.a_armed = True
+
+  def _a_refuse(self, why: str) -> None:
+    raise ZhouyiError(f"a job that {why} after the rows-mode GEMMs' A staging buffer (the GM window's A region, ops.gemm_a_gm) was handed "
+                      "out: its producers and GEMMs would see different memories (GM vs the window's DDR backing). Run without it "
+                      "(ZHOUYI_GEMM_AGM=0) in a process that also runs such jobs")
+
   # ---- jobs ----
   def job(self, tcbs: Buffer, groups: list, gm_pa: int|None) -> tuple[list, int|None]:
     """The chain being built in `tcbs`: its mode, its groups (GM-data jobs: the DDR homes of arena text) and its GM window (None: off)."""
@@ -197,9 +222,11 @@ class TextGM:
       if gs: raise ZhouyiError(f"a job with a GM-data member (GM on for data) holds GSRAM-using image(s) at {[hex(a) for a in gs]}: GSRAM is empty "
                                "while GM is on (GM.md §3d), so this job cannot be right; run them in separate jobs")
       if gm_pa != self.raw.gm_window()[0]: raise ZhouyiError("a GM-data job must use the device's GM window (RawDevice.gm_window)")
+      if self.a_armed: self._a_refuse("uses GM for data")
       self.jobs[tcbs.pa] = _Job("data", tcbs, [])
       return [g._replace(spc=self._ddr_addr(g.spc)) for g in groups], gm_pa
     mode = "off" if gs else "text"
+    if gs and self.a_armed: self._a_refuse(f"runs GM off (GSRAM-using image(s) at {[hex(a) for a in gs]})")
     imgs = [self.at.get(g.spc) for g in groups]
     j = self.jobs[tcbs.pa] = _Job(mode, tcbs, imgs)
     i = 0

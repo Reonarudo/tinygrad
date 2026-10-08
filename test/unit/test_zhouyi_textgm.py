@@ -142,6 +142,24 @@ class TestTextGM(unittest.TestCase):
     raw.submit(other.pa, 0, 0); self.assertFalse(tg.in_gm, "a chain built elsewhere may have used GM")
     j = tg.jobs[tcbs.pa]; raw.free_buf(tcbs); self.assertFalse(j.alive); self.assertNotIn(tcbs.pa, tg.jobs)
 
+  def test_gemm_a_region(self):
+    """The rows-mode GEMMs' A staging buffer lies above the arena, below the C partials, inside the window; the preload
+    stops below it; once handed out, a GM-off (GSRAM user) or GM-data job is refused and text jobs run as before."""
+    textgm.PROMOTE_QUIET = 1
+    raw = FakeRaw(); tg = raw.text_gm; w = self._win(raw)
+    lo, hi = textgm.gemm_a_region(raw)
+    self.assertEqual((lo, hi), (w + textgm.GEMM_A_OFF, w + textgm.GEMM_A_OFF + textgm.GEMM_A_CAP))
+    self.assertGreaterEqual(lo, w + textgm.TEXT_GM_CAP, "above the text arena (a preload covers [0, top) <= TEXT_GM_CAP)")
+    self.assertLessEqual(hi, textgm.gemm_c_base(raw, 0) if textgm.TEXT_GM else w + textgm.GEMM_C_OFF, "below the C partials")
+    self.assertGreaterEqual(textgm.GEMM_A_CAP, 17408 * 8 * 3, "rows 9-12 at K 17408 (rt 3)")
+    lays, tcbs = chain(raw, [image(1)]); raw.submit(tcbs.pa, 0, 0)
+    tg.arm_a(); self.assertTrue(tg.a_armed)
+    lays, tcbs = chain(raw, [image(2)]); raw.submit(tcbs.pa, 0, 0)
+    self.assertEqual(grid(tcbs), (1, raw.gm_window()[0]), "text jobs run GM on as before")
+    self.assertLessEqual(tg.top, textgm.GEMM_A_OFF)
+    with self.assertRaises(ZhouyiError): chain(raw, [image(3), IM.text_only(K.k_gsram_dump(), sync_lint=False)])
+    with self.assertRaises(ZhouyiError): chain(raw, [image(4)], gm_pa=raw.gm_window()[0])
+
   def test_full_arena_ranks_by_launches(self):
     textgm.TEXT_GM_CAP, textgm.RANK_FIRST, textgm.PROMOTE_QUIET = 2 * 4096, 8, 1
     raw = FakeRaw(); tg = raw.text_gm

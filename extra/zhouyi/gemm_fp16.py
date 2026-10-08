@@ -69,13 +69,18 @@ def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup", tscale: s
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
-                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False, tscale: str = "f32") -> bytes:
+                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False, tscale: str = "f32", c_rt: int | None = None) -> bytes:
     """+0 the A row-block slice (`a_bytes`, default ks x 96; rows mode: the compact ks x 32 rt), +32 the B group slice (fp16, or
     the E4M3 codes with `b8`), +64 the row block's C drain (`k_gemm_gs(drain="dma")`; + its 192 B of row maxima with `rowmax`),
     +96 the slice's scale table (`bscale`, ns x 128 B, or ns x 64 B with `scales="single"`), +128 (`prefetch`: k_gemm_gs rows
-    mode) a slice's codes and scales in one (`tern`: 2-bit codes, ns x ks x 16 B; `tscale`: its scale table's format)."""
+    mode) a slice's codes and scales in one (`tern`: 2-bit codes, ns x ks x 16 B; `tscale`: its scale table's format).
+    `c_rt` (rows mode, 1 or 2): the C drain carries only the first `c_rt` row tiles of each strip's 768-B tile -- a
+    strided request of ns sub-blocks of 256 c_rt B at a 768-B pitch on both ends (the staging buffer and C keep their layouts) --
+    so the rows past them are left untouched in C instead of written as zeros (768 / 1536 B a group at ns 3 instead of 2304)."""
     scl = gs_scale_bytes(ns, ks, q8, scales, tscale)                                     # a slice's scale table
-    ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), D.desc_words(ns * 768 + (192 if rowmax else 0))] + ([D.desc_words(scl)] if bscale else [])
+    assert c_rt in (None, 1, 2) and not (c_rt and rowmax), c_rt
+    drain = D.desc_words(ns * 768 + (192 if rowmax else 0)) if not c_rt else D.desc_words(ns * 256 * c_rt, width=256 * c_rt, ext_stride=768, int_stride=768)
+    ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), drain] + ([D.desc_words(scl)] if bscale else [])
     if prefetch or bscale: ws.append(D.desc_words(ns * ks * (16 if tern else 64) + scl))   # +128: a slice's codes + scales in one request
     out = bytearray(32 * len(ws))
     for i, w in enumerate(ws): out[32 * i:32 * i + 24] = np.asarray(w, np.uint32).tobytes()
