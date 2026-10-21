@@ -31,7 +31,7 @@ OWN = getenv("ZHOUYI_GRAPH_OWN", 1) == 1
 # ZHOUYI_ASYNC (default 1, needs OWN): a frozen replay leaves its last job in flight and returns; the device's next submit, host
 # read or write, free, slot map or synchronize waits for it first (`RawDevice.drain`), so the host's work between two graph calls
 # runs under the device's. One job is on the device at a time, as before. Off under ZHOUYI_HANG_ID >= 2 (the cycle stamps).
-ASYNC = OWN and getenv("ZHOUYI_ASYNC", 1) == 1 and _hid.LEVEL < 2
+ASYNC = getenv("ZHOUYI_ASYNC", 1) == 1 and _hid.LEVEL < 2   # (and the graph's own launch state: ZhouyiGraph.own)
 
 
 class _Frozen:
@@ -167,6 +167,9 @@ class ZhouyiGraph(GraphRunner):
     return GraphRunner.supports_exec_item(batch_devs, new_call)
 
   def __init__(self, *args, **kwargs):
+    # OWN as it is when this graph is built (a caller may build some graphs with shared launch state -- many large graphs, e.g. a
+    # batched prefill's, whose clones would not fit the window -- and others with their own); the async tail needs its own
+    self.own = OWN
     super().__init__(*args, **kwargs)
     # A chain member or Program holds one launch state, so each repeat of the same runner in this graph
     # gets its own clone (members: `clone_member`; Programs: `CompiledRunner(p)`, same lib, new Launch).
@@ -180,10 +183,10 @@ class ZhouyiGraph(GraphRunner):
     seen: set = set()
     for i, ji in enumerate(self.jit_cache):
       if _is_member(ji.prg) and hasattr(ji.prg, "_clone_args"):
-        if OWN or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=clone_member(ji.prg))
+        if self.own or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=clone_member(ji.prg))
         seen.add(id(ji.prg))
-      elif isinstance(ji.prg, CompiledRunner) and (self._chainable(ji) is not None or (OWN and isinstance(ji.prg._prg, ZhouyiProgram))):
-        if OWN or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=CompiledRunner(ji.prg.p))
+      elif isinstance(ji.prg, CompiledRunner) and (self._chainable(ji) is not None or (self.own and isinstance(ji.prg._prg, ZhouyiProgram))):
+        if self.own or id(ji.prg) in seen: self.jit_cache[i] = ji = _replace(ji, prg=CompiledRunner(ji.prg.p))
         seen.add(id(ji.prg))
     prgs = [self._chainable(ji) for ji in self.jit_cache]
     # the plan: ("chain", _Chain) | ("solo", ExecItem), in launch order
@@ -247,7 +250,7 @@ class ZhouyiGraph(GraphRunner):
         # `_chainable` implies `_freezable` for Programs today; if not, fall back to the staged path for this chain. A chain member
         # (a GEMM runner) is not packed: each call re-runs its `stage_chain`, which rewrites nothing while its buffers are the same
         # (a key of three addresses) -- with OWN no other graph stages it in between.
-        if any(not _is_member(prg) and self._freezable(ji) is None for ji, prg, _ in chain.items) or (not OWN and any(_is_member(p) for _, p, _ in chain.items)):
+        if any(not _is_member(prg) and self._freezable(ji) is None for ji, prg, _ in chain.items) or (not self.own and any(_is_member(p) for _, p, _ in chain.items)):
           steps.append(("chain_slow", chain))
           continue
         members = []
@@ -382,12 +385,12 @@ class ZhouyiGraph(GraphRunner):
         if kind in ("chain", "chain_slow"):
           chain = step[1]
           sub = (chain.head_pa, chain.first_pa, chain.last_pa)
-          if ASYNC and k == last and not wait: raw.submit_async(*sub, tag=self, report=self._async_report(k))
+          if ASYNC and self.own and k == last and not wait: raw.submit_async(*sub, tag=self, report=self._async_report(k))
           else: submit_wait(raw, [sub])
         elif kind == "psolo":
           _, prg, ps = step
           subs = [prg._one_job()] if prg.ntasks > ZHOUYI_TECS else prg.chains
-          if ASYNC and k == last and not wait and len(subs) == 1: raw.submit_async(*subs[0], tag=self, report=self._async_report(k))
+          if ASYNC and self.own and k == last and not wait and len(subs) == 1: raw.submit_async(*subs[0], tag=self, report=self._async_report(k))
           else: submit_wait(raw, subs)
         else: step[1].run(var_vals, wait=False, jit=True, do_update_stats=False)
     except ZhouyiError as e:
