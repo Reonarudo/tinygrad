@@ -62,10 +62,19 @@ def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup", tscale: s
     """A K-slice's scale table in a block-scaled gemm_gs stream: E4M3 (q8 0) [s][4 tiles][8] fp32 = 128 B a strip (`scales`
     "dup": each scale stored twice, the kernel's lane layout) or [s][4 tiles][4] fp32 = 64 B a strip ("single": each once, the
     kernel widens it); Q8_0 with the correction kernel (q8 1, ks 8) 16 fp16 a strip; Q8_0 dequantised in fp16 (q8 2) 16 fp16 a
-    strip and 32-weight block. `tscale="f16"` (tern): 16 fp16 a strip (`pack_b_group_tern(tscale="f16")`)."""
+    strip and 32-weight block. `tscale="f16"` (tern): 16 fp16 a strip (`pack_b_group_tern(tscale="f16")`). q8 3 (Q4_K in fp16,
+    `pack_b_group_q4f`): 16 fp16 a + 16 fp16 b a strip and 32-weight sub-block; q8 4 (Q6_K as q8 2 with 16-weight blocks): 16 fp16 a
+    strip and 16-weight block."""
     assert scales in SCALE_LAYOUTS and tscale in TERN_TSCALES, (scales, tscale)
     if tscale == "f16": return ns * 32
+    if q8 == 3: return ns * 64 * (ks // 8)
+    if q8 == 4: return ns * 32 * (ks // 4)
     return ns * (128 if scales == "dup" else 64) if not q8 else ns * 32 if q8 == 1 else ns * 32 * (ks // 8)
+
+
+def code_bytes(q8: int = 0, tern: bool = False) -> int:
+    """B stream bytes a strip k-step (64 weights) of a b8 gemm_gs: 2-bit ternary codes 16, 4-bit Q4_K codes (q8 3) 32, else 64."""
+    return 16 if tern else 32 if q8 == 3 else 64
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
@@ -81,7 +90,7 @@ def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bsc
     assert c_rt in (None, 1, 2) and not (c_rt and rowmax), c_rt
     drain = D.desc_words(ns * 768 + (192 if rowmax else 0)) if not c_rt else D.desc_words(ns * 256 * c_rt, width=256 * c_rt, ext_stride=768, int_stride=768)
     ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), drain] + ([D.desc_words(scl)] if bscale else [])
-    if prefetch or bscale: ws.append(D.desc_words(ns * ks * (16 if tern else 64) + scl))   # +128: a slice's codes + scales in one request
+    if prefetch or bscale: ws.append(D.desc_words(ns * ks * code_bytes(q8, tern) + scl))   # +128: a slice's codes + scales in one request
     out = bytearray(32 * len(ws))
     for i, w in enumerate(ws): out[32 * i:32 * i + 24] = np.asarray(w, np.uint32).tobytes()
     return bytes(out)
@@ -186,20 +195,63 @@ def pack_b_group_q8(q: np.ndarray, d: np.ndarray, group: int, ns: int, ks: int =
     return np.ascontiguousarray(np.concatenate([panels, sc16], 1)).ravel()
 
 
-def pack_b_group_q8f(q: np.ndarray, d: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
+def pack_b_group_q8f(q: np.ndarray, d: np.ndarray, group: int, ns: int, ks: int = 32, qb: int = 32) -> np.ndarray:
     """B `[N, K]` GGUF Q8_0 (int8 q, `d[N, K/32]`) -> `k_gemm_gs(b8=True, bscale=True, q8f=True, ks)`'s stream for strips
     `group*ns .. +ns`: per K-slice (4 ks wide, ks / 8 Q8_0 blocks) the codes as u = q + 128 in the panel order (ns x ks x 64 B),
     then the scales [s][block][16 cols] fp16 d (32 B a strip and block). The kernel builds each weight in fp16 -- 1024 + u by a
     zip under 0x64, - 1152 (exact: q), x d (one rounding) -- so a slice needs no scale or correction pass. Rows past N get code
-    128 and scale 0."""
-    N, K = q.shape; nb = ks // 8; assert ks % 8 == 0 and K % (4 * ks) == 0 and d.shape == (N, K // 32), (q.shape, d.shape)
+    128 and scale 0. `qb` 16 (`k_gemm_gs(q8f, qb=16)`, GGUF Q6_K): a scale per 16 weights, `d[N, K/16]`, 32 B a strip and block."""
+    N, K = q.shape; nb = 4 * ks // qb; assert qb in (16, 32) and ks % 8 == 0 and K % (4 * ks) == 0 and d.shape == (N, K // qb), (q.shape, d.shape)
     assert float(np.abs(d).max(initial=0)) < 65504, "Q8_0 scales beyond fp16"
     r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // (4 * ks); nr = max(0, min(N, r1) - r0)
     codes = np.full((16 * ns, K), 128, np.uint8); codes[:nr] = (q[r0:r0 + nr].astype(np.int16) + 128).astype(np.uint8)
     panels = np.ascontiguousarray(codes.reshape(ns, 4, 4, nsl, ks, 4).transpose(3, 0, 4, 1, 2, 5)).reshape(nsl, -1)   # [slice][s kk j n k]
-    sc = np.zeros((16 * ns, K // 32), np.float16); sc[:nr] = d[r0:r0 + nr].astype(np.float16)
+    sc = np.zeros((16 * ns, K // qb), np.float16); sc[:nr] = d[r0:r0 + nr].astype(np.float16)
     sc16 = np.ascontiguousarray(sc.reshape(ns, 16, nsl, nb).transpose(2, 0, 3, 1)).reshape(nsl, -1).view(np.uint8)    # [slice][s][block][16 cols]
     return np.ascontiguousarray(np.concatenate([panels, sc16], 1)).ravel()
+
+
+def pack_b_group_q4f(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
+    """B `[N, K]` 4-bit codes u (0..15) with w = a u + b per 32 weights along K (`a`, `b` `[N, K/32]`: GGUF Q4_K's d sc and -dmin m)
+    -> `k_gemm_gs(b8=True, bscale=True, q4f=True, ks)`'s stream for strips `group*ns .. +ns`: per K-slice (4 ks wide, ks / 8
+    sub-blocks) the codes, per strip and k-step pair 64 B ([tile j][lane 4 n + k]: k-step 2p's code in the low nibble, 2p + 1's in
+    the high one), then [s][sub-block][a 16 cols | b 16 cols] fp16 (64 B a strip and sub-block). Rows past N get code 0 and a = b = 0."""
+    N, K = u.shape; nb = ks // 8; assert ks % 8 == 0 and K % (4 * ks) == 0 and a.shape == b.shape == (N, K // 32), (u.shape, a.shape, b.shape)
+    assert max(float(np.abs(a).max(initial=0)) * 16, float(np.abs(b).max(initial=0))) < 65504, "Q4_K (a, b) beyond fp16"
+    r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // (4 * ks); nr = max(0, min(N, r1) - r0)
+    codes = np.zeros((16 * ns, K), np.uint8); codes[:nr] = u[r0:r0 + nr]
+    t = codes.reshape(ns, 4, 4, nsl, ks // 2, 2, 4).transpose(3, 0, 4, 5, 1, 2, 6)          # [slice][s][p][h][j][n][k]
+    nib = np.ascontiguousarray(t[:, :, :, 0] | (t[:, :, :, 1] << 4)).reshape(nsl, -1)       # [slice][s p j n k]
+    ab = np.zeros((2, 16 * ns, K // 32), np.float16); ab[0, :nr] = a[r0:r0 + nr]; ab[1, :nr] = b[r0:r0 + nr]
+    sc = np.ascontiguousarray(ab.reshape(2, ns, 16, nsl, nb).transpose(3, 1, 4, 0, 2)).reshape(nsl, -1).view(np.uint8)   # [slice][s][sub][a|b][16]
+    return np.ascontiguousarray(np.concatenate([nib, sc], 1)).ravel()
+
+
+def q4k_split(blk: np.ndarray):
+    """GGUF Q4_K super-blocks `[N, K/256, 144]` -> (u uint8 [N, K], a float32 [N, K/32], b float32 [N, K/32]) with w = a u + b:
+    a = d sc, b = -dmin m per 32-weight sub-block (ggml's dequantisation, factored)."""
+    N, nsb = blk.shape[:2]; f = blk.reshape(-1, 144)
+    d = f[:, 0:2].copy().view(np.float16)[:, 0].astype(np.float32); dmin = f[:, 2:4].copy().view(np.float16)[:, 0].astype(np.float32)
+    sc, qs = f[:, 4:16].astype(np.int32), f[:, 16:144]
+    s = np.empty((f.shape[0], 8), np.int32); m = np.empty_like(s)
+    s[:, :4], m[:, :4] = sc[:, 0:4] & 63, sc[:, 4:8] & 63
+    s[:, 4:] = (sc[:, 8:12] & 0xF) | ((sc[:, 0:4] >> 6) << 4); m[:, 4:] = (sc[:, 8:12] >> 4) | ((sc[:, 4:8] >> 6) << 4)
+    q = qs.reshape(-1, 4, 32); u = np.stack([q & 0xF, q >> 4], 2).reshape(-1, 8, 32)     # sub-block 2i: low nibbles of chunk i, 2i + 1: high
+    return u.reshape(N, nsb * 256), (d[:, None] * s).reshape(N, nsb * 8), (-dmin[:, None] * m).reshape(N, nsb * 8)
+
+
+def q6k_split(blk: np.ndarray):
+    """GGUF Q6_K super-blocks `[N, K/256, 210]` -> (q int8 [N, K] in -32..31, d float32 [N, K/16]) with w = d q (d = the
+    super-block's d x the 16-weight block's int8 scale): `pack_b_group_q8f(qb=16)`'s operands."""
+    N, nsb = blk.shape[:2]; f = blk.reshape(-1, 210)
+    ql, qh = f[:, 0:128].astype(np.int32), f[:, 128:192].astype(np.int32)
+    sc = f[:, 192:208].copy().view(np.int8).astype(np.float32); d = f[:, 208:210].copy().view(np.float16)[:, 0].astype(np.float32)
+    q = np.empty((f.shape[0], 256), np.int32)
+    for n in range(2):
+        L, Hh = ql[:, 64 * n:64 * n + 64], qh[:, 32 * n:32 * n + 32]; o = 128 * n
+        q[:, o:o + 32] = (L[:, :32] & 0xF) | ((Hh & 3) << 4); q[:, o + 32:o + 64] = (L[:, 32:] & 0xF) | (((Hh >> 2) & 3) << 4)
+        q[:, o + 64:o + 96] = (L[:, :32] >> 4) | (((Hh >> 4) & 3) << 4); q[:, o + 96:o + 128] = (L[:, 32:] >> 4) | (((Hh >> 6) & 3) << 4)
+    return (q - 32).astype(np.int8).reshape(N, nsb * 256), (d[:, None] * sc).reshape(N, nsb * 16)
 
 
 def reference_group(a_f16: np.ndarray, b_e4m3: np.ndarray, group: int, ns: int) -> np.ndarray:
