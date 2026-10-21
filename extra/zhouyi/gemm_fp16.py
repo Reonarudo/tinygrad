@@ -230,8 +230,8 @@ def pack_b_group_q4f(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns
 
 def pack_b_group_q4m(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
     """`k_gemm_gs(q4m)`'s stream (gemm_gs(q8=5)): the same weights as `pack_b_group_q4f` (w = a u + b per 32 along K), the codes
-    in its order, then per strip [a: 4 sub-blocks x 16 cols fp16][b: a panel tile, column 4 j + n's sub-block k at lane 4 n + k]
-    (256 B a strip and slice). The kernel builds a u and adds b through one extra mma k-step against the A slice's sub-block sums."""
+    in its order, then the slice's table: [s][4 sub-blocks][16 cols] fp16 a, then [s] b panel tiles (column 4 j + n's sub-block k
+    at lane 4 n + k): 256 B a strip and slice. The kernel builds a u and adds b through one extra mma k-step against the A slice's sub-block sums."""
     N, K = u.shape; assert ks == 32 and K % 128 == 0 and a.shape == b.shape == (N, K // 32), (u.shape, a.shape, b.shape)
     assert float(np.abs(a).max(initial=0)) * 4096 < 65504 and float(np.abs(b).max(initial=0)) < 65504, "Q4_K (a, b) beyond fp16 x 2^12"
     r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // 128; nr = max(0, min(N, r1) - r0)
@@ -241,7 +241,7 @@ def pack_b_group_q4m(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns
     ab = np.zeros((2, 16 * ns, K // 32), np.float16); ab[0, :nr] = a[r0:r0 + nr]; ab[1, :nr] = b[r0:r0 + nr]
     at = ab[0].reshape(ns, 16, nsl, 4).transpose(2, 0, 3, 1)                                   # [slice][s][sb][16 cols]
     bt = ab[1].reshape(ns, 4, 4, nsl, 4).transpose(3, 0, 1, 2, 4)                              # [slice][s][j][n][sb]
-    sc = np.concatenate([at.reshape(nsl, ns, 64), bt.reshape(nsl, ns, 64)], 2).reshape(nsl, -1).view(np.uint8)
+    sc = np.concatenate([at.reshape(nsl, ns * 64), bt.reshape(nsl, ns * 64)], 1).view(np.uint8)          # [slice]: [s][sb] a, then [s] b tiles
     return np.ascontiguousarray(np.concatenate([nib, sc], 1)).ravel()
 
 
