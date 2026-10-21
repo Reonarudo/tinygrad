@@ -69,12 +69,13 @@ def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup", tscale: s
     if tscale == "f16": return ns * 32
     if q8 == 3: return ns * 64 * (ks // 8)
     if q8 == 4: return ns * 32 * (ks // 4)
+    if q8 == 5: assert ks == 32; return ns * 256
     return ns * (128 if scales == "dup" else 64) if not q8 else ns * 32 if q8 == 1 else ns * 32 * (ks // 8)
 
 
 def code_bytes(q8: int = 0, tern: bool = False) -> int:
     """B stream bytes a strip k-step (64 weights) of a b8 gemm_gs: 2-bit ternary codes 16, 4-bit Q4_K codes (q8 3) 32, else 64."""
-    return 16 if tern else 32 if q8 == 3 else 64
+    return 16 if tern else 32 if q8 in (3, 5) else 64
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
@@ -224,6 +225,23 @@ def pack_b_group_q4f(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns
     nib = np.ascontiguousarray(t[:, :, :, 0] | (t[:, :, :, 1] << 4)).reshape(nsl, -1)       # [slice][s p j n k]
     ab = np.zeros((2, 16 * ns, K // 32), np.float16); ab[0, :nr] = a[r0:r0 + nr]; ab[1, :nr] = b[r0:r0 + nr]
     sc = np.ascontiguousarray(ab.reshape(2, ns, 16, nsl, nb).transpose(3, 1, 4, 0, 2)).reshape(nsl, -1).view(np.uint8)   # [slice][s][sub][a|b][16]
+    return np.ascontiguousarray(np.concatenate([nib, sc], 1)).ravel()
+
+
+def pack_b_group_q4m(u: np.ndarray, a: np.ndarray, b: np.ndarray, group: int, ns: int, ks: int = 32) -> np.ndarray:
+    """`k_gemm_gs(q4m)`'s stream (gemm_gs(q8=5)): the same weights as `pack_b_group_q4f` (w = a u + b per 32 along K), the codes
+    in its order, then per strip [a: 4 sub-blocks x 16 cols fp16][b: a panel tile, column 4 j + n's sub-block k at lane 4 n + k]
+    (256 B a strip and slice). The kernel builds a u and adds b through one extra mma k-step against the A slice's sub-block sums."""
+    N, K = u.shape; assert ks == 32 and K % 128 == 0 and a.shape == b.shape == (N, K // 32), (u.shape, a.shape, b.shape)
+    assert float(np.abs(a).max(initial=0)) * 4096 < 65504 and float(np.abs(b).max(initial=0)) < 65504, "Q4_K (a, b) beyond fp16 x 2^12"
+    r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // 128; nr = max(0, min(N, r1) - r0)
+    codes = np.zeros((16 * ns, K), np.uint8); codes[:nr] = u[r0:r0 + nr]
+    t = codes.reshape(ns, 4, 4, nsl, ks // 2, 2, 4).transpose(3, 0, 4, 5, 1, 2, 6)
+    nib = np.ascontiguousarray(t[:, :, :, 0] | (t[:, :, :, 1] << 4)).reshape(nsl, -1)
+    ab = np.zeros((2, 16 * ns, K // 32), np.float16); ab[0, :nr] = a[r0:r0 + nr]; ab[1, :nr] = b[r0:r0 + nr]
+    at = ab[0].reshape(ns, 16, nsl, 4).transpose(2, 0, 3, 1)                                   # [slice][s][sb][16 cols]
+    bt = ab[1].reshape(ns, 4, 4, nsl, 4).transpose(3, 0, 1, 2, 4)                              # [slice][s][j][n][sb]
+    sc = np.concatenate([at.reshape(nsl, ns, 64), bt.reshape(nsl, ns, 64)], 2).reshape(nsl, -1).view(np.uint8)
     return np.ascontiguousarray(np.concatenate([nib, sc], 1)).ravel()
 
 

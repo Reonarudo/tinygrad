@@ -121,7 +121,7 @@ class GemmGSRunner(Runner):
     # 2 = the weights built in fp16 during the expand (ks a multiple of 8: no per-slice scaling); 3 = GGUF Q4_K, 4-bit codes built
     # in fp16 as a u + b (`pack_b_group_q4f`); 4 = GGUF Q6_K as 2 with a scale per 16 weights (`pack_b_group_q8f(qb=16)`)
     self.q8 = int(cf.src[19].arg) if len(cf.src) > 19 else 0
-    assert self.q8 in (0, 1, 2, 3, 4), self.q8
+    assert self.q8 in (0, 1, 2, 3, 4, 5), self.q8
     assert not self.bscale or (self.b8 and not self.lin48 and not self.rowmax and (self.ks == 32 if not self.q8 else self.ks == 8 if self.q8 == 1 else self.ks % 8 == 0)), \
       "gemm_gs(bscale): b8, ks=32 (q8 1: 8, q8 2-4: a multiple of 8), no lin48/rowmax"
     # the E4M3 block-scale table's layout: what the pack says (`gemm_gs(scales=)`, src[20]: 0 dup / 1 single); the kernel is built
@@ -166,7 +166,7 @@ class GemmGSRunner(Runner):
       assert not self.b8 or drain == "dma"
       self.text = _image.text_only(_KT.k_gemm_gs(self.ks, self.ns, self.nrbh, c_stride=self.gstride, drain=drain, rowmax=bool(self.rowmax), b8=bool(self.b8), kw=4 if self.bscale else 3, bscale=bool(self.bscale),
                                                    rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None, bsel=bool(self.bsel),
-                                                   q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern),
+                                                   q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, q4m=self.q8 == 5, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern),
                                                    tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst"), tscale=self.tscale,   # the rt-1 ternary k-loop order
                                                    tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w"),   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
                                                    # the Q8_0 (q8 1) rows-mode strip loop and expand, scheduled (orig = the old order)
@@ -201,7 +201,7 @@ class GemmGSRunner(Runner):
       lay = Launch(self.raw, self.text, b""); lay.chain([13], group_widths=[4, 4, 4, 1], dep=[0, 0, 0, _dev.DEP_PRE_ALL]); self.launches.append(lay)
     self._chain_gen = 0
     self._staged_key = None
-    super().__init__(f"TEC gemm_gs{'+rowmax' if self.rowmax else ''}{'+b8' if self.b8 else ''}{'+bscale' if self.bscale else ''}{'+sc1' if self.scales == 'single' else ''}{('+q8', '+q8', '+q8f', '+q4k', '+q6k')[self.q8] if self.q8 else ''}{'+tern' if self.tern else ''}{'+f16s' if self.tern == 2 else ''}{f'+rows{self.rows}' if self.rows else ''}{'+bsel' if self.bsel else ''} M={12*self.nrb} K={4*self.ks*self.nslices} N={16*self.ns*self.ngroups} x{self.heads} ({len(self.tasks)} tasks, {self.nl} launches)", device)
+    super().__init__(f"TEC gemm_gs{'+rowmax' if self.rowmax else ''}{'+b8' if self.b8 else ''}{'+bscale' if self.bscale else ''}{'+sc1' if self.scales == 'single' else ''}{('+q8', '+q8', '+q8f', '+q4k', '+q6k', '+q4m')[self.q8] if self.q8 else ''}{'+tern' if self.tern else ''}{'+f16s' if self.tern == 2 else ''}{f'+rows{self.rows}' if self.rows else ''}{'+bsel' if self.bsel else ''} M={12*self.nrb} K={4*self.ks*self.nslices} N={16*self.ns*self.ngroups} x{self.heads} ({len(self.tasks)} tasks, {self.nl} launches)", device)
   def clone(self) -> "GemmGSRunner":
     """A runner with launch state of its own (a graph position's: `ops_zhouyi.clone_member`) sharing everything read-only -- the
     image (Launch's image cache), the descriptors, the plan -- instead of re-running __init__ (the k-loop's code generation)."""
@@ -537,7 +537,8 @@ def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:in
       C comes out fully scaled.
     q8 (bscale, ks=8): `b` is `pack_b_group_q8`'s stream (int8 codes, a scale per 32 weights: GGUF Q8_0).
     q8=2 (bscale, ks a multiple of 8): `pack_b_group_q8f`'s stream (the same weights, built in fp16 in the kernel: no per-slice scaling).
-    q8=3: `pack_b_group_q4f`'s stream (GGUF Q4_K: 4-bit codes, w = a u + b per 32 weights); q8=4: `pack_b_group_q8f(qb=16)`'s (Q6_K).
+    q8=3: `pack_b_group_q4f`'s stream (GGUF Q4_K: 4-bit codes, w = a u + b per 32 weights); q8=4: `pack_b_group_q8f(qb=16)`'s (Q6_K);
+    q8=5 (ks 32): `pack_b_group_q4m`'s (Q4_K, a u built by full-rate multiplies, b by an extra mma k-step a slice).
     scales (bscale, E4M3): the scale table's layout the stream was packed in -- "dup" (`pack_b_group_bscale`'s default: each
       scale twice, 128 B a strip and slice) or "single" (`scales="single"`: once, 64 B; the kernel rebuilds the lanes, C
       bit-identical). The pack's marker decides (the caller passes it here).
