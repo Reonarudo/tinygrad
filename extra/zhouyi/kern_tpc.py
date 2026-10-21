@@ -3794,7 +3794,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
               rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False, tkloop="orig", tscale="f32", tkloop2="orig", gkloop="orig",
-              q4f=False, qb=32, bsel=False, q4m=False, qdiag=()):
+              q4f=False, qb=32, bsel=False, q4m=False, qdiag=(), gblock=False):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3892,7 +3892,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     assert not (bsel and stamps), "k_gemm_gs(bsel): r9 carries the slot (no stamps)"
     # `qdiag` (diagnostics, wrong results; the rows-mode prefetch path): "noexp" drops the expand, "exp2" runs it twice, "nok" drops
     # each strip's k-loop -- with timing="pfnodma" (no B / A requests), the differences split a slice's compute into its parts
-    assert set(qdiag) <= {"noexp", "exp2", "nok"}, qdiag
+    assert set(qdiag) <= {"noexp", "exp2", "nok", "nosp"}, qdiag
+    # `gblock` (the full layout, a task of 2 row blocks, block-scaled codes): K-slices outer, the task's groups inner -- both row blocks'
+    # A slice loaded once a slice (and its q4m sub-block sums), each group's codes requested and expanded against it, the groups' C
+    # resident in GSRAM ([g][rb][s]: the run's groups x 2 x ns x 768 B <= 64 KiB, the runner's run length). Without it A is re-read
+    # for every group (DDR-bound at prefill shapes: an expert head of 24 rows read 16 times a GEMM).   # ("nosp": no q4m sub-block sums; any path: "noexp" / "nok" too)
     assert gkloop in ("orig", "sched", "schedg"), gkloop
     assert tkloop in ("orig", "mmfirst"), tkloop
     assert tkloop2 in ("orig", "m8e5", "m8e4", "m8u", "m8w"), tkloop2
@@ -3976,6 +3980,8 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma", "pfnodma", "pfnodma2")
     SPB = (256 if TF else 64) * RT                 # TF: the k-loop's starting offsets (a register a C register) instead of S'
     SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile; TF: the C start offsets; q4m: the sub-block sums)", SPB, vld_tail=True) if SP or q4m else None
+    SPO1 = LS.alloc("gblock q4m: row block 1's sub-block sums", SPB, vld_tail=True) if gblock and q4m else None
+    CB1 = LS.alloc("gblock: the next group's codes + scales", CBB, vld_tail=True) if gblock else None
     QSV = LS.alloc("q4m: the slice's a 2^12 tile vectors ((strip, sub-block) b at 128 b)", ns * 4 * 128, vld_tail=True) if q4m else None
     # rows mode, rt <= 2, block-scaled E4M3: the next slice's B (codes + scales, one DMA through DESC +128) and compact A are
     # requested while the current slice expands and computes. LSRAM: fp16 panels [0, 2 BH) | A x2 | one staging | B x2
@@ -4255,7 +4261,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
             body[-1] = BUNDLE(*(list(body[-1]) + [I("add r14, r14, 256", E.add("r14", "r14", 256))]))
             e += body + [BUNDLE(I("loopend", E.loopend()))]
         return e
-    def sprep4(half_reg):          # q4m: each row's four 32-weight sub-block sums of the A slice, fp16, as row tile i's A tile [4 rows][4 sub-blocks] -> SPO + 32 i
+    def sprep4(half_reg, spo=None):   # q4m: each row's four 32-weight sub-block sums of the A slice, fp16, as row tile i's A tile [4 rows][4 sub-blocks] -> SPO + 32 i
         c = _mov32("r7", 0x3C003C00)                                                               # fp16 1.0 twice
         for sb in range(4):        # E_sb: a B tile whose column sb is all ones (lanes 4 sb .. 4 sb + 3)
             c += [BUNDLE(I("mov4 t%d, 0" % (20 + sb), E.mov4("t%d" % (20 + sb), 0)))]
@@ -4269,7 +4275,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
             body += [BUNDLE(*[I("mma t%d.fp32, t%d.fp32, %s.fp16, t%d.fp16" % (2 * i, 2 * i + 1, AR[i], 20 + sb), E.mma("t%d" % (2 * i), AR[i], "t%d" % (20 + sb))) for i in range(i0, min(RT, i0 + 2))]) for i0 in range(0, RT, 2)]
             body += [BUNDLE(I("add r13, r13, %d" % AST, E.add("r13", "r13", AST)))]
             c += body + [BUNDLE(I("loopend", E.loopend()))]
-        c += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
+        c += _mov32("r7", SPO if spo is None else spo) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
         for i in range(RT):
             c += [BUNDLE(I("cvt.d t%d.fp16, t%d.fp32, t%d.fp32" % (24 + i, 2 * i, 2 * i + 1), E.cvtd_f16("t%d" % (24 + i), "t%d" % (2 * i), "t%d" % (2 * i + 1))))]
         c += [BUNDLE(I("st t%d, [r7+%d]" % (24 + i, 32 * i), E.vst("t%d" % (24 + i), "r7", 32 * i))) for i in range(RT)]
@@ -4395,7 +4401,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     if q4m: expand = expand_q4m
     if tern: expand = expand_tern
 
-    def strips(half_reg, stg=None, scl=None, cratio=None):
+    def strips(half_reg, stg=None, scl=None, cratio=None, spo=None):
         """All `ns` strips against the row block in `half_reg`; r13 walks the panels, r15 the C blocks.
         `stg` (drain=dma): the row block's LSRAM staging offset. `scl`: a register holding the slice's codes (scales at +BH)."""
         if TF: return strips_tf(half_reg, stg, scl or "r20")
@@ -4428,7 +4434,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         if stamps: body += [CYC("r30")]
         if "nok" not in qdiag: body += [BUNDLE(I("loop r10", E.loop("r10")))] + kbody + [BUNDLE(I("loopend", E.loopend()))]
         if q4m:                    # the b k-step: C(i, j) += S(i) B_b(j) -- S the row tile's sub-block sums (SPO), B_b the strip's b tile (r30 + 128)
-            body += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
+            body += _mov32("r7", SPO if spo is None else spo) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
             lds = [("t%d" % (24 + i), "r7", 32 * i) for i in range(RT)] + [("t%d" % (27 + j), "r30", 128 * ns + 32 * j) for j in range(4)]
             body += [BUNDLE(*[I("ld %s, [%s+%d]" % x, E.vld(*x)) for x in lds[k:k + 2]]) for k in range(0, len(lds), 2)]
             mm = [(i, j) for i in range(RT) for j in range(4)]
@@ -4948,7 +4954,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         sl += add("r1", "r1", BH + SCLB)
         sl += add("r16", "r5", 0) + add("r17", "r22", 0) + add("r15", "r29", 0) + (add("r28", "r2", 0) if rowmax else [])
         sl += dmaq(sync(1) + [dma_in("r7", "r23", "r9", "r17")]) + add("r17", "r17", a_rb_stride)          # row block 0 -> half 0
-        sl += dmaq(wait(0)) + ([] if timing == "dmaonly" or TF else expand("r20" if bscale else None))
+        sl += dmaq(wait(0)) + ([] if timing == "dmaonly" or TF or "noexp" in qdiag else expand("r20" if bscale else None))
     if PF:
         # Group-blocked (rows mode): blocks of gb <= GBLK groups; per K-slice, A once for the block and B for each group, the
         # groups' C accumulators resident in GSRAM (group g at g x CROW). Registers: r1 block's B base (the next block's is
@@ -4991,15 +4997,35 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     else:
         rb = [BUNDLE(I("sub r16, r16, 2", E.sub("r16", "r16", 2)))]
         rb += wait(1) + sync(2) + [dma_in("r7", "r23", "r11", "r17")] + add("r17", "r17", a_rb_stride)  # odd row block -> half 1
-        rb += (sprep("r9") if SP else sprep4("r9") if q4m else []) + strips("r9", STG0 - BREG)
+        rb += (sprep("r9") if SP else sprep4("r9") if q4m and "nosp" not in qdiag else []) + strips("r9", STG0 - BREG)
         rb += wait(2) + prefetch("r9", 1)
-        rb += (sprep("r11") if SP else sprep4("r11") if q4m else []) + strips("r11", STG1 - BREG)
+        rb += (sprep("r11") if SP else sprep4("r11") if q4m and "nosp" not in qdiag else []) + strips("r11", STG1 - BREG)
         rb.append(BUNDLE(I("cbnz r16, .Lrb", E.cbnz("r16", -len(rb)))))
-    if not PF:
+    if gblock:                     # slices outer, groups inner (see `gblock` above); r24 the slice's B base, r16 B bytes a group, r28 groups left
+        assert not SINGLE and not PF and bscale and DMA_DRAIN and nrb == 2 and not rowmax and not stamps and c_rb_ratio == 1, "k_gemm_gs(gblock)"
+        SLB = BH + SCLB; body = add("r18", "r4", 0) + add("r22", "r0", 0) + add("r24", "r1", 0) + _mov32("r7", SLB) + [BUNDLE(I("mul r16, r4, r7", E.mul("r16", "r4", "r7")))]
+        body += _mov32("r7", CB1) + [BUNDLE(I("add r21, r12, r7", E.add("r21", "r12", "r7")))]                  # (r12: the LSRAM base, as the CB above)
+        sl = add("r17", "r22", 0) + dmaq(sync(1) + [dma_in("r7", "r23", "r9", "r17")]) + add("r17", "r17", a_rb_stride)
+        sl += dmaq(sync(2) + [dma_in("r7", "r23", "r11", "r17")]) + dmaq(wait(1)) + dmaq(wait(2))
+        if q4m and "nosp" not in qdiag: sl += sprep4("r9") + sprep4("r11", SPO1)
+        # the codes double-buffered: group g + 1's request (into r21) is issued once g's has landed (one request a flag), before g's
+        # expand and strips; r20 / r21 swap every group
+        sl += add("r15", "r29", 0) + add("r1", "r24", 0) + add("r28", "r19", 0) + dmaq([dma_in("zero", "r26", "r21", "r1")])
+        def mv(d, s_): return [BUNDLE(I("add %s, %s, 0" % (d, s_), E.add(d, s_, 0)))]
+        gl = mv("r7", "r20") + mv("r20", "r21") + mv("r21", "r7") + dmaq(wait(0)) + [BUNDLE(I("add r1, r1, r16", E.add("r1", "r1", "r16")))]
+        gl += ifz([BUNDLE(I("sub r7, r28, 1", E.sub("r7", "r28", 1)))], [], dmaq([dma_in("zero", "r26", "r21", "r1")]))
+        gl += ([] if "noexp" in qdiag else expand("r20"))
+        gl += strips("r9", STG0 - BREG) + strips("r11", STG1 - BREG, spo=SPO1)
+        gl += [BUNDLE(I("sub r28, r28, 1", E.sub("r28", "r28", 1)))]
+        gl.append(BUNDLE(I("cbnz r28, .Lgrp", E.cbnz("r28", -len(gl)))))
+        sl += gl + add("r22", "r22", "r6") + add("r24", "r24", SLB) + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
+        sl.append(BUNDLE(I("cbnz r18, .Lslice", E.cbnz("r18", -len(sl)))))
+        body += sl
+    elif not PF:
         sl += rb
         sl += add("r22", "r22", "r6") + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
         sl.append(BUNDLE(I("cbnz r18, .Lslice", E.cbnz("r18", -len(sl)))))
-    body += sl
+    if not gblock: body += sl
     # drain: C region GSRAM -> DDR by the TEC
     if not DMA_DRAIN:
         body += add("r15", "r29", 0) + add("r16", "r5", 0) + add("r17", "r2", 0)
@@ -5013,8 +5039,9 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         d.append(BUNDLE(I("cbnz r16, .Ldrain", E.cbnz("r16", -len(d)))))
         body += d
     # next group: C out advances, A rewinds (r0), B continues (r1)
-    body += add("r2", "r2", c_stride) + [BUNDLE(I("sub r19, r19, 1", E.sub("r19", "r19", 1)))]
-    body.append(BUNDLE(I("cbnz r19, .Lgroup", E.cbnz("r19", -len(body)))))
+    if not gblock:
+        body += add("r2", "r2", c_stride) + [BUNDLE(I("sub r19, r19, 1", E.sub("r19", "r19", 1)))]
+        body.append(BUNDLE(I("cbnz r19, .Lgroup", E.cbnz("r19", -len(body)))))
     body = body_head + (blk if PF else body)
     if stamps:  # total = now - entry stamp at [r28+0]
         body += [CYC("r30"), BUNDLE(I("ld r7, [r28+0]", E.ld("r7", "r28", 0))), BUNDLE(I("sub r30, r30, r7", E.sub("r30", "r30", "r7"))),
