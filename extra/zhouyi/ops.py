@@ -134,6 +134,10 @@ class GemmGSRunner(Runner):
     assert self.tern in (0, 1, 2), self.tern
     self.tscale = "f16" if self.tern == 2 else "f32"
     assert not self.tern or (self.bscale and not self.q8 and self.scales == "single" and self.ks == 32), "gemm_gs(tern): bscale, scales='single', ks 32"
+    # bsel (`gemm_gs(bsel=)`, src[22]): head h's B is offset by the 32-bit word at slot h of a fourth buffer (k_gemm_gs(bsel)): the
+    # experts a router picked, without re-staging the launch
+    self.bsel = int(cf.src[22].arg) if len(cf.src) > 22 else 0
+    assert not self.bsel or (not self.lin48 and self.b8), "gemm_gs(bsel): the b8 streams, not lin48"
     # lin48: the 48-deep, 3-strip kernel over the same 24-deep / 6-strip A and C layouts (faster at large K).
     # Each 6-strip group is two half-groups h, weight panels repacked `[h][G][K/192][3][48 kk]`
     # (`gemm_fp16.repack_panels_48x3`); a task = (head, half, row piece, run of groups).
@@ -161,7 +165,7 @@ class GemmGSRunner(Runner):
       pf_ok = bool(self.rows) and -(-self.rows // 4) <= 2 and bool(self.b8) and bool(self.bscale) and os.environ.get("ZHOUYI_GEMM_TIMING", "") in ("", "pfnodma", "pfnodma2")   # the rows-mode prefetch path
       assert not self.b8 or drain == "dma"
       self.text = _image.text_only(_KT.k_gemm_gs(self.ks, self.ns, self.nrbh, c_stride=self.gstride, drain=drain, rowmax=bool(self.rowmax), b8=bool(self.b8), kw=4 if self.bscale else 3, bscale=bool(self.bscale),
-                                                   rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None,
+                                                   rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None, bsel=bool(self.bsel),
                                                    q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern),
                                                    tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst"), tscale=self.tscale,   # the rt-1 ternary k-loop order
                                                    tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w"),   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
@@ -197,7 +201,7 @@ class GemmGSRunner(Runner):
       lay = Launch(self.raw, self.text, b""); lay.chain([13], group_widths=[4, 4, 4, 1], dep=[0, 0, 0, _dev.DEP_PRE_ALL]); self.launches.append(lay)
     self._chain_gen = 0
     self._staged_key = None
-    super().__init__(f"TEC gemm_gs{'+rowmax' if self.rowmax else ''}{'+b8' if self.b8 else ''}{'+bscale' if self.bscale else ''}{'+sc1' if self.scales == 'single' else ''}{('+q8', '+q8', '+q8f', '+q4k', '+q6k')[self.q8] if self.q8 else ''}{'+tern' if self.tern else ''}{'+f16s' if self.tern == 2 else ''}{f'+rows{self.rows}' if self.rows else ''} M={12*self.nrb} K={4*self.ks*self.nslices} N={16*self.ns*self.ngroups} x{self.heads} ({len(self.tasks)} tasks, {self.nl} launches)", device)
+    super().__init__(f"TEC gemm_gs{'+rowmax' if self.rowmax else ''}{'+b8' if self.b8 else ''}{'+bscale' if self.bscale else ''}{'+sc1' if self.scales == 'single' else ''}{('+q8', '+q8', '+q8f', '+q4k', '+q6k')[self.q8] if self.q8 else ''}{'+tern' if self.tern else ''}{'+f16s' if self.tern == 2 else ''}{f'+rows{self.rows}' if self.rows else ''}{'+bsel' if self.bsel else ''} M={12*self.nrb} K={4*self.ks*self.nslices} N={16*self.ns*self.ngroups} x{self.heads} ({len(self.tasks)} tasks, {self.nl} launches)", device)
   def clone(self) -> "GemmGSRunner":
     """A runner with launch state of its own (a graph position's: `ops_zhouyi.clone_member`) sharing everything read-only -- the
     image (Launch's image cache), the descriptors, the plan -- instead of re-running __init__ (the k-loop's code generation)."""
@@ -217,9 +221,9 @@ class GemmGSRunner(Runner):
   def chain_deps(self) -> list: return [_dev.DEP_PRE_ALL, 0, 0, _dev.DEP_PRE_ALL] * self.nl
   def stage_chain(self, rawbufs:list[Buffer]) -> None: self._prepare(rawbufs)
   def _prepare(self, rawbufs:list[Buffer]):
-    key = tuple(self.raw.dev_addr(b._buf) for b in rawbufs[:3])
+    key = tuple(self.raw.dev_addr(b._buf) for b in rawbufs[:4 if self.bsel else 3])
     if self._staged_key == key: return
-    c, a, b = key; a += self.a_off; b += self.b_off; c += self.c_off; d = self.raw.dev_addr(self.desc)
+    c, a, b = key[:3]; sel = key[3] if self.bsel else 0; a += self.a_off; b += self.b_off; c += self.c_off; d = self.raw.dev_addr(self.desc)
     from extra.zhouyi import gemm_fp16 as _gfp
     if self.raw.text_gm is not None:   # A in the GM window's A staging buffer (gemm_a_gm): rows mode only, and all of it inside
       lo, hi = _textgm.gemm_a_region(self.raw)
@@ -246,8 +250,10 @@ class GemmGSRunner(Runner):
             args = (a + h * self.a_stride + pc * self.nrbh * self.ks * 96, b + (h // self.bdiv) * self.b_stride + g0 * gb,
                     c + h * self.c_stride + g0 * self.gstride + pc * self.nrbh * self.crow, d, self.nslices, self.nrbh, self.a_slice,
                     cbase(t), ng)
+          if self.bsel: args = args + (sel + 4 * h,)
         else: args = (a, b, c, d, 0, self.nrbh, self.nrb * self.ks * 96, cbase(t % 12), 0)  # NSLICES = 0: the task exits (barrier and spare tasks)
-        ctypes.memmove(lay.params[t].va, struct.pack("<9I", *args), 36)
+        if self.bsel and len(args) == 9: args = args + (sel,)
+        ctypes.memmove(lay.params[t].va, struct.pack(f"<{len(args)}I", *args), 4 * len(args))
     self._staged_key = key
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
     self._prepare(rawbufs)
@@ -513,7 +519,7 @@ def e4m3_stream(src, out=None):
   return Tensor(out.uop.after(fn.call(out.uop, src.uop)))
 
 
-def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:int=1, a_stride:int=0, b_stride:int=0, c_stride:int=0, a_off:int=0, b_off:int=0, c_off:int=0, piece:int=0, lin48:bool=False, rowmax:bool=False, b8:bool=False, b_head_div:int=1, bscale:bool=False, rows:int=0, q8:int=0, scales:str="dup", tern:bool=False, tscale:str="f32", out=None):
+def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:int=1, a_stride:int=0, b_stride:int=0, c_stride:int=0, a_off:int=0, b_off:int=0, c_off:int=0, piece:int=0, lin48:bool=False, rowmax:bool=False, b8:bool=False, b_head_div:int=1, bscale:bool=False, rows:int=0, q8:int=0, scales:str="dup", tern:bool=False, tscale:str="f32", bsel=None, out=None):
   """`C = A @ B^T` on the TEC matrix unit (`GemmGSRunner`); returns the fp32 C tiles.
 
     a: A layout (uint16 halves, `vec_f16` / `gemm_fp16.pack_a_slices`: 12*nrb rows x 4*ks*nslices).
@@ -543,14 +549,16 @@ def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:in
       k-step) + the per-(column, slice) scale table; C comes out fully scaled.
     tscale (tern): the stream's scale table -- "f32" (`pack_b_group_tern`'s default: single-layout fp32 s x 2^18, 64 B a strip
       and slice) or "f16" (`pack_b_group_tern(tscale="f16")` / `tern_stream_f16`: fp16 s x 2^15, 32 B; 2.125 bits a weight, C
-      bit-identical). The pack's marker decides (the caller passes it here)."""
+      bit-identical). The pack's marker decides (the caller passes it here).
+    bsel (b8): an int32 tensor of `heads` slots: head h's B starts `bsel[h]` bytes past `b` + b_off (+ h // b_head_div x b_stride);
+      the slots are read by the kernel at every launch, so a host poke or a routing kernel picks the experts per token."""
   from tinygrad.tensor import Tensor
   a = a.contiguous(); b = b.contiguous()
   if out is None: out = Tensor.empty(heads * ngroups * nrb * (ns * 192 + (48 if rowmax else 0)), device=a.device, dtype=dtypes.float32)
   assert scales in ("dup", "single"), scales
   assert tscale in ("f32", "f16") and (tscale == "f32" or tern), tscale
-  fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=tuple(UOp.const(dtypes.int, int(v)) for v in (ks, ns, nrb, nslices, ngroups, heads, 2 * a_stride, (1 if b8 else 2) * b_stride, 4 * c_stride, 2 * a_off, (1 if b8 else 2) * b_off, 4 * c_off, piece, int(lin48), int(rowmax), int(b8), int(b_head_div), int(bscale), int(rows), int(q8), int(scales == "single"), (2 if tscale == "f16" else 1) if tern else 0)), arg=GEMM_GS_ARG)
-  return Tensor(out.uop.after(fn.call(out.uop, a.uop, b.uop)))
+  fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=tuple(UOp.const(dtypes.int, int(v)) for v in (ks, ns, nrb, nslices, ngroups, heads, 2 * a_stride, (1 if b8 else 2) * b_stride, 4 * c_stride, 2 * a_off, (1 if b8 else 2) * b_off, 4 * c_off, piece, int(lin48), int(rowmax), int(b8), int(b_head_div), int(bscale), int(rows), int(q8), int(scales == "single"), (2 if tscale == "f16" else 1) if tern else 0, int(bsel is not None))), arg=GEMM_GS_ARG)
+  return Tensor(out.uop.after(fn.call(out.uop, a.uop, b.uop, *([bsel.contiguous().uop] if bsel is not None else []))))
 
 
 CHAIN_MEMBER_ARGS.update({CSRC_ARG, GEMM_GS_ARG, E4M3_STREAM_ARG})

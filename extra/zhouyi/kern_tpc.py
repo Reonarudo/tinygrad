@@ -3794,7 +3794,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
               rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False, tkloop="orig", tscale="f32", tkloop2="orig", gkloop="orig",
-              q4f=False, qb=32):
+              q4f=False, qb=32, bsel=False):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3880,6 +3880,10 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # block per slice position) pack the slot-2 lane moves and stores beside the ALU ops. C is bit-identical.
     # "schedg" (diagnostic): "sched" with the group block's C accumulators left in GSRAM (the prefetch path's "sched" keeps them in
     # LSRAM, compact: a strip's 8 rt registers, as the tern fast path does).
+    # `bsel` (a mixture of experts' selected weights): r9 = the address of a 32-bit offset, added to B (r1) before anything reads
+    # it -- head h's task points at slot h of a table the host (or a routing kernel) writes per token, so one launch runs the heads
+    # on the experts the slots name (offset = expert x its stream's bytes in a stack of equal streams).
+    assert not (bsel and stamps), "k_gemm_gs(bsel): r9 carries the slot (no stamps)"
     assert gkloop in ("orig", "sched", "schedg"), gkloop
     assert tkloop in ("orig", "mmfirst"), tkloop
     assert tkloop2 in ("orig", "m8e5", "m8e4", "m8u", "m8w"), tkloop2
@@ -4825,6 +4829,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     skip = 1
     body += [BUNDLE(I("add r29, r7, 0", E.add("r29", "r7", 0)))]  # GSRAM C base, before r7 is scratch
     body += [BUNDLE(I("add r31, r8, 0", E.add("r31", "r8", 0)))] if False else [BUNDLE(I("add r19, r8, 0", E.add("r19", "r8", 0)))]  # group count
+    if bsel: body += [BUNDLE(I("ld r10, [r9+0]", E.ld("r10", "r9", 0))), BUNDLE(I("add r1, r1, r10", E.add("r1", "r1", "r10")))]   # B += the head's slot
     if stamps: body += [BUNDLE(I("add r28, r9, 0", E.add("r28", "r9", 0))), CYC("r30"), BUNDLE(I("st r30, [r28+0]", E.st("r30", "r28", 0))), BUNDLE(I("mov r20, 0", E.mov("r20", 0))), BUNDLE(I("mov r21, 0", E.mov("r21", 0))), BUNDLE(I("mov r26, 0", E.mov("r26", 0)))]
     if rowmax: body += _mov32("r7", 0xFF800000) + [BUNDLE(I("bcast t31.w, r7", E.bcast("t31", "r7")))]  # t31 = -inf
     body += _lsram_base("r12") + add("r25", "r12", BREG) + add("r9", "r12", A0) + add("r11", "r12", A1) + add("r23", "r3", 0) + add("r24", "r3", 32)
@@ -4942,7 +4947,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                  BUNDLE(I("st r21, [r28+8]", E.st("r21", "r28", 8))), BUNDLE(I("st r26, [r28+12]", E.st("r26", "r28", 12)))]
     if DMA_DRAIN and timing != "dmaonly": body += wait_flags(3)  # last row block's drain
     body[skip] = BUNDLE(I("b .Ldone", E.b(len(body) - skip)))
-    return prologue(10 if stamps else 9) + body + epilogue()
+    return prologue(10 if stamps or bsel else 9) + body + epilogue()
 
 
 def k_mma32_bench(gs="none", ks=24):
