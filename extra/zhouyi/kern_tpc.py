@@ -3794,7 +3794,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
               rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False, tkloop="orig", tscale="f32", tkloop2="orig", gkloop="orig",
-              q4f=False, qb=32, bsel=False, q4m=False, qdiag=(), gblock=False):
+              q4f=False, qb=32, bsel=False, q4m=False, qdiag=(), gblock=0):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3892,7 +3892,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     assert not (bsel and stamps), "k_gemm_gs(bsel): r9 carries the slot (no stamps)"
     # `qdiag` (diagnostics, wrong results; the rows-mode prefetch path): "noexp" drops the expand, "exp2" runs it twice, "nok" drops
     # each strip's k-loop -- with timing="pfnodma" (no B / A requests), the differences split a slice's compute into its parts
-    assert set(qdiag) <= {"noexp", "exp2", "nok", "nosp"}, qdiag
+    assert set(qdiag) <= {"noexp", "exp2", "nok", "nosp", "noc"}, qdiag   # ("noc": no C loads / stores between slices)
     # `gblock` (the full layout, a task of 2 row blocks, block-scaled codes): K-slices outer, the task's groups inner -- both row blocks'
     # A slice loaded once a slice (and its q4m sub-block sums), each group's codes requested and expanded against it, the groups' C
     # resident in GSRAM ([g][rb][s]: the run's groups x 2 x ns x 768 B <= 64 KiB, the runner's run length). Without it A is re-read
@@ -3980,8 +3980,12 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma", "pfnodma", "pfnodma2")
     SPB = (256 if TF else 64) * RT                 # TF: the k-loop's starting offsets (a register a C register) instead of S'
     SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile; TF: the C start offsets; q4m: the sub-block sums)", SPB, vld_tail=True) if SP or q4m else None
+    if gblock and LS.limit - (-(-LS.used // 32) * 32) - 64 < CBB + (SPB if q4m else 0): gblock = 0   # (the second codes buffer does not fit: the plain order)
     SPO1 = LS.alloc("gblock q4m: row block 1's sub-block sums", SPB, vld_tail=True) if gblock and q4m else None
-    CB1 = LS.alloc("gblock: the next group's codes + scales", CBB, vld_tail=True) if gblock else None
+    # `bpf` (the full layout, block-scaled, not gblock): the next K-slice's codes + scales requested while this one expands and
+    # computes (CB / CB1 swap a slice; the request of the task's last slice skipped) -- when a second buffer fits LSRAM
+    BPF = bscale and b8 and not SINGLE and not gblock and not tern and LS.limit - (-(-LS.used // 32) * 32) - 16 >= CBB
+    CB1 = LS.alloc("gblock / bpf: the next codes + scales", CBB, vld_tail=True) if gblock or BPF else None
     QSV = LS.alloc("q4m: the slice's a 2^12 tile vectors ((strip, sub-block) b at 128 b)", ns * 4 * 128, vld_tail=True) if q4m else None
     # rows mode, rt <= 2, block-scaled E4M3: the next slice's B (codes + scales, one DMA through DESC +128) and compact A are
     # requested while the current slice expands and computes. LSRAM: fp16 panels [0, 2 BH) | A x2 | one staging | B x2
@@ -4506,9 +4510,9 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                 qs = [q for q in range(6) if c0 + q < NC]
                 adds += [BUNDLE(*[cload_into(24 + q, c0 + q) for q in qs[p:p + 2]]) for p in range(0, len(qs), 2)]
                 adds += [BUNDLE(*[I("add t%d.fp32, t%d.fp32, t%d.fp32, p7.w" % (c0 + q, c0 + q, 24 + q), E.vaddf("t%d" % (c0 + q), "t%d" % (c0 + q), "t%d" % (24 + q))) for q in qs[p:p + 2]]) for p in range(0, len(qs), 2)]
-            body += ifz(first_slice, [], adds) + add("r30", "r30", 128 if q4m else SCLB // ns)   # (q4m: r30 + 128 ns is the strip's b tile)
+            body += ifz(first_slice, [], [] if "noc" in qdiag else adds) + add("r30", "r30", 128 if q4m else SCLB // ns)   # (q4m: r30 + 128 ns is the strip's b tile)
         stores = [BUNDLE(cstore(t)) for t in range(NC)]
-        body += ifz(last_slice, stage_c() + (rowmax_strip() if rowmax else []), [] if timing == "noc" else stores) if DMA_DRAIN else stores
+        body += ifz(last_slice, stage_c() + (rowmax_strip() if rowmax else []), [] if timing == "noc" or "noc" in qdiag else stores) if DMA_DRAIN else stores
         if stamps: body += [CYC("r7")] + acc("r26", "r30", "r7")
         body += add("r15", "r15", 768) + [BUNDLE(I("sub r27, r27, 1", E.sub("r27", "r27", 1)))]
         body.append(BUNDLE(I("cbnz r27, .Lstrip", E.cbnz("r27", -len(body)))))
@@ -4916,6 +4920,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     body += _lsram_base("r12") + add("r25", "r12", BREG) + add("r9", "r12", A0) + add("r11", "r12", A1) + add("r23", "r3", 0) + add("r24", "r3", 32)
     if bscale and not PF:          # the codes + scales buffer and its descriptor (one request a slice, flag 0)
         body += add("r20", "r12", CB) + add("r26", "r3", 128)
+        if BPF: body += _mov32("r7", CB1) + [BUNDLE(I("add r21, r12, r7", E.add("r21", "r12", "r7")))] + dmaq([dma_in("zero", "r26", "r21", "r1")])
     if PF:                         # buffers (r9 / r11 A, r20 / r21 B: current / next), r5 = B bytes a group, the first step's requests
         body += add("r9", "r12", PA0) + add("r11", "r12", PA1) + add("r20", "r12", PCB0) + add("r21", "r12", PCB1) + add("r26", "r3", 128)
         body += _mov32("r7", BH + SCLB) + [BUNDLE(I("mul r5, r4, r7", E.mul("r5", "r4", "r7")))]
@@ -4944,17 +4949,23 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         sl += add("r16", "r5", 0) + add("r17", "r22", 0) + add("r15", "r29", 0) + (add("r28", "r2", 0) if rowmax else [])
         sl += sync(1) + [dma_in("r7", "r23", "r9", "r17")] + add("r17", "r17", a_rb_stride)          # row block 0 -> half 0
     else:                          # codes -> upper half of B region; row block 0's A; then expand
-        if bscale:                 # codes + scales (contiguous in DDR) -> CB in one request on flag 0
+        if bscale and BPF:         # this slice's codes were requested into r21 by the previous slice (or before the first): swap,
+            # wait for them, request the next slice's (sequential in DDR across groups too) unless this is the task's last slice
+            def mv(d, s_): return [BUNDLE(I("add %s, %s, 0" % (d, s_), E.add(d, s_, 0)))]
+            sl = mv("r7", "r20") + mv("r20", "r21") + mv("r21", "r7") + dmaq(wait(0)) + add("r1", "r1", BH + SCLB)
+            sl += ifz([BUNDLE(I("sub r7, r18, 1", E.sub("r7", "r18", 1))), BUNDLE(I("sub r10, r19, 1", E.sub("r10", "r19", 1))), BUNDLE(I("or r7, r7, r10", E.or_("r7", "r7", "r10")))],
+                      [], dmaq([dma_in("zero", "r26", "r21", "r1")]))
+        elif bscale:               # codes + scales (contiguous in DDR) -> CB in one request on flag 0
             sl = []
             if poison:
                 sl += _mov32("r7", 0x7FC00000) + [BUNDLE(I("bcast t31.w, r7", E.bcast("t31", "r7")))] + add("r13", "r20", BH)
                 sl += [BUNDLE(I("st t31, [r13+%d]" % (32 * i), E.vst("t31", "r13", 32 * i))) for i in range(SCLB // 32)]
             sl += dmaq([dma_in("zero", "r26", "r20", "r1")])
-        else: sl = add("r14", "r25", BH) + dmaq([dma_in("zero", "r24", "r14", "r1")])
-        sl += add("r1", "r1", BH + SCLB)
+            sl += add("r1", "r1", BH + SCLB)
+        else: sl = add("r14", "r25", BH) + dmaq([dma_in("zero", "r24", "r14", "r1")]) + add("r1", "r1", BH + SCLB)
         sl += add("r16", "r5", 0) + add("r17", "r22", 0) + add("r15", "r29", 0) + (add("r28", "r2", 0) if rowmax else [])
         sl += dmaq(sync(1) + [dma_in("r7", "r23", "r9", "r17")]) + add("r17", "r17", a_rb_stride)          # row block 0 -> half 0
-        sl += dmaq(wait(0)) + ([] if timing == "dmaonly" or TF or "noexp" in qdiag else expand("r20" if bscale else None))
+        sl += ([] if BPF else dmaq(wait(0))) + ([] if timing == "dmaonly" or TF or "noexp" in qdiag else expand("r20" if bscale else None))
     if PF:
         # Group-blocked (rows mode): blocks of gb <= GBLK groups; per K-slice, A once for the block and B for each group, the
         # groups' C accumulators resident in GSRAM (group g at g x CROW). Registers: r1 block's B base (the next block's is
@@ -5003,14 +5014,17 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         rb.append(BUNDLE(I("cbnz r16, .Lrb", E.cbnz("r16", -len(rb)))))
     if gblock:                     # slices outer, groups inner (see `gblock` above); r24 the slice's B base, r16 B bytes a group, r28 groups left
         assert not SINGLE and not PF and bscale and DMA_DRAIN and nrb == 2 and not rowmax and not stamps and c_rb_ratio == 1, "k_gemm_gs(gblock)"
-        SLB = BH + SCLB; body = add("r18", "r4", 0) + add("r22", "r0", 0) + add("r24", "r1", 0) + _mov32("r7", SLB) + [BUNDLE(I("mul r16, r4, r7", E.mul("r16", "r4", "r7")))]
+        # blocks of `gblock` groups (the task's run in blocks: r5 = this block's groups; A re-read once a block), C in GSRAM [g][rb][s]
+        GBG = int(gblock); assert 1 <= GBG and GBG * 2 * ns * 768 <= 65536, gblock
+        SLB = BH + SCLB; body = _mov32("r7", SLB) + [BUNDLE(I("mul r16, r4, r7", E.mul("r16", "r4", "r7")))]
         body += _mov32("r7", CB1) + [BUNDLE(I("add r21, r12, r7", E.add("r21", "r12", "r7")))]                  # (r12: the LSRAM base, as the CB above)
+        blkh = _mov32("r7", GBG) + [BUNDLE(I("mn r5, r19, r7", E.mn("r5", "r19", "r7")))] + add("r18", "r4", 0) + add("r22", "r0", 0) + add("r24", "r1", 0)
         sl = add("r17", "r22", 0) + dmaq(sync(1) + [dma_in("r7", "r23", "r9", "r17")]) + add("r17", "r17", a_rb_stride)
         sl += dmaq(sync(2) + [dma_in("r7", "r23", "r11", "r17")]) + dmaq(wait(1)) + dmaq(wait(2))
         if q4m and "nosp" not in qdiag: sl += sprep4("r9") + sprep4("r11", SPO1)
         # the codes double-buffered: group g + 1's request (into r21) is issued once g's has landed (one request a flag), before g's
         # expand and strips; r20 / r21 swap every group
-        sl += add("r15", "r29", 0) + add("r1", "r24", 0) + add("r28", "r19", 0) + dmaq([dma_in("zero", "r26", "r21", "r1")])
+        sl += add("r15", "r29", 0) + add("r1", "r24", 0) + add("r28", "r5", 0) + dmaq([dma_in("zero", "r26", "r21", "r1")])
         def mv(d, s_): return [BUNDLE(I("add %s, %s, 0" % (d, s_), E.add(d, s_, 0)))]
         gl = mv("r7", "r20") + mv("r20", "r21") + mv("r21", "r7") + dmaq(wait(0)) + [BUNDLE(I("add r1, r1, r16", E.add("r1", "r1", "r16")))]
         gl += ifz([BUNDLE(I("sub r7, r28, 1", E.sub("r7", "r28", 1)))], [], dmaq([dma_in("zero", "r26", "r21", "r1")]))
@@ -5020,7 +5034,12 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         gl.append(BUNDLE(I("cbnz r28, .Lgrp", E.cbnz("r28", -len(gl)))))
         sl += gl + add("r22", "r22", "r6") + add("r24", "r24", SLB) + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]
         sl.append(BUNDLE(I("cbnz r18, .Lslice", E.cbnz("r18", -len(sl)))))
-        body += sl
+        # the next block's B: r24 has walked the block's slices (+ r16, the bytes a group), so it starts at r24 + (r5 - 1) r16
+        bk = blkh + sl + [BUNDLE(I("mul r7, r5, r16", E.mul("r7", "r5", "r16")))] + add("r1", "r24", 0) + [BUNDLE(I("add r1, r1, r7", E.add("r1", "r1", "r7"))), BUNDLE(I("sub r1, r1, r16", E.sub("r1", "r1", "r16")))]
+        bk += _mov32("r10", c_stride) + [BUNDLE(I("mul r10, r5, r10", E.mul("r10", "r5", "r10"))), BUNDLE(I("add r2, r2, r10", E.add("r2", "r2", "r10"))),
+                                        BUNDLE(I("sub r19, r19, r5", E.sub("r19", "r19", "r5")))]
+        bk.append(BUNDLE(I("cbnz r19, .Lgblock", E.cbnz("r19", -len(bk)))))
+        body += bk
     elif not PF:
         sl += rb
         sl += add("r22", "r22", "r6") + [BUNDLE(I("sub r18, r18, 1", E.sub("r18", "r18", 1)))]

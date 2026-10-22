@@ -111,7 +111,7 @@ class GemmGSRunner(Runner):
   chain_member = True
   chain_cycles = False
   GSRAM = 0xF8000000      # the C partials' home without text in GM (`textgm.gemm_c_base`)
-  ENV_KEYS = ('ZHOUYI_GEMM_GB', 'ZHOUYI_GEMM_QDIAG', 'ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2', 'ZHOUYI_GEMM_KLOOP', 'ZHOUYI_GEMM_CDRAIN')   # read in __init__: part of the runner cache key (_cached_runner)
+  ENV_KEYS = ('ZHOUYI_GEMM_GB', 'ZHOUYI_GEMM_GBMAX', 'ZHOUYI_GEMM_QDIAG', 'ZHOUYI_GEMM_DRAIN', 'ZHOUYI_GEMM_TIMING', 'ZHOUYI_TERN_KLOOP', 'ZHOUYI_TERN_KLOOP2', 'ZHOUYI_GEMM_KLOOP', 'ZHOUYI_GEMM_CDRAIN')   # read in __init__: part of the runner cache key (_cached_runner)
   def __init__(self, cf:UOp, device:str):
     from extra.zhouyi import kern_tpc as _KT, gemm_fp16 as _G
     self.ks, self.ns, self.nrb, self.nslices, self.ngroups, self.heads, self.a_stride, self.b_stride, self.c_stride, self.a_off, self.b_off, self.c_off, piece, self.lin48, self.rowmax, self.b8, self.bdiv = (int(x.arg) for x in cf.src[:17])
@@ -152,7 +152,7 @@ class GemmGSRunner(Runner):
     # gblock (the full layout, 2 row blocks a task, block-scaled codes): slices outer, groups inner, the run's C resident in GSRAM
     # (k_gemm_gs(gblock)): A once a slice instead of once a group. ZHOUYI_GEMM_GB=0: the plain order
     self.gblock = bool(self.bscale and not self.rows and not self.lin48 and self.nrbh == 2 and os.environ.get("ZHOUYI_GEMM_GB", "0") == "1")   # (off: slower on the board than the plain order, 29.8 vs 25.8 ms on an expert gate -- 2026-10-22)
-    self.gb_max = 65536 // (2 * self.ns * 768)
+    self.gb_max = min(65536 // (2 * self.ns * 768), int(os.environ.get("ZHOUYI_GEMM_GBMAX", "4")))   # groups a block: a small C working set (its GSRAM accesses slow down with the window full)
     # rowmax: each row block's C row (ns x 768 B) is followed by its rows' maxima (192 B; `k_gemm_gs(rowmax=True)`)
     assert not (self.rowmax and self.lin48), "rowmax is the attention scores' kernel (24 x 6)"
     self.crow = self.ns * 768 + (192 if self.rowmax else 0)
@@ -169,7 +169,7 @@ class GemmGSRunner(Runner):
       pf_ok = bool(self.rows) and -(-self.rows // 4) <= 2 and bool(self.b8) and bool(self.bscale) and os.environ.get("ZHOUYI_GEMM_TIMING", "") in ("", "pfnodma", "pfnodma2")   # the rows-mode prefetch path
       assert not self.b8 or drain == "dma"
       self.text = _image.text_only(_KT.k_gemm_gs(self.ks, self.ns, self.nrbh, c_stride=self.gstride, drain=drain, rowmax=bool(self.rowmax), b8=bool(self.b8), kw=4 if self.bscale or self.ks % 3 else 3, bscale=bool(self.bscale),
-                                                   rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None, bsel=bool(self.bsel), gblock=self.gblock, qdiag=tuple(x for x in os.environ.get("ZHOUYI_GEMM_QDIAG", "").split(",") if x),
+                                                   rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None, bsel=bool(self.bsel), gblock=self.gb_max if self.gblock else 0, qdiag=tuple(x for x in os.environ.get("ZHOUYI_GEMM_QDIAG", "").split(",") if x),
                                                    q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, q4m=self.q8 == 5, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern),
                                                    tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst"), tscale=self.tscale,   # the rt-1 ternary k-loop order
                                                    tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w"),   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
@@ -189,7 +189,6 @@ class GemmGSRunner(Runner):
     hp = self.heads * self.npieces * halves; best = None
     for r in range(1, self.ngroups + 1):
       runs = [self.ngroups // r + (1 if i < self.ngroups % r else 0) for i in range(r)]
-      if self.gblock and max(runs) > self.gb_max: continue                    # (gblock: a run's C must fit the task's GSRAM)
       ntask = hp * r; nl = -(-ntask // 12)
       cost = nl * (max(runs) + 2)  # launches x (longest run + ~2 groups of per-launch overhead: C zeroing, barrier, setup)
       if best is None or cost < best[0]: best = (cost, runs)
