@@ -6,6 +6,7 @@ encoder produces cannot drift apart; the gate is a whole-image byte diff.
 The prologue carries the FP enable (`image.fp_enable`): without it every vector-arithmetic
 instruction (fp32 `fma` as well as `mml`/`mma`) traps to exception vector 3, which presents as a hang.
 """
+import os
 import struct
 from typing import NamedTuple
 
@@ -3892,7 +3893,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     assert not (bsel and stamps), "k_gemm_gs(bsel): r9 carries the slot (no stamps)"
     # `qdiag` (diagnostics, wrong results; the rows-mode prefetch path): "noexp" drops the expand, "exp2" runs it twice, "nok" drops
     # each strip's k-loop -- with timing="pfnodma" (no B / A requests), the differences split a slice's compute into its parts
-    assert set(qdiag) <= {"noexp", "exp2", "nok", "nosp", "noc"}, qdiag   # ("noc": no C loads / stores between slices)
+    assert set(qdiag) <= {"noexp", "exp2", "nok", "nosp", "noc", "intexp", "noint"}, qdiag   # (q4m expand: "intexp" without its fp16 multiplies, "noint" without its integer split)   # ("noc": no C loads / stores between slices)
     # `gblock` (the full layout, a task of 2 row blocks, block-scaled codes): K-slices outer, the task's groups inner -- both row blocks'
     # A slice loaded once a slice (and its q4m sub-block sums), each group's codes requested and expanded against it, the groups' C
     # resident in GSRAM ([g][rb][s]: the run's groups x 2 x ns x 768 B <= 64 KiB, the runner's run length). Without it A is re-read
@@ -4311,12 +4312,16 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         ops = [tz_ld("%%x%d" % v, "r13", 32 * v) for v in range(2)] + [tz_ld("%%s%d" % j, "r3", 32 * j) for j in range(4)]
         for j in range(4):         # code registers x0, x1 -> tiles j of k-steps 2p (low nibbles) and 2p + 1 (high)
             f_, h_, x_ = "%%f%d" % j, "%%h%d" % j, "%%x%d" % (j // 2)
-            ops += [wb(f_, x_, bool(j % 2)), vand(h_, f_), isub(f_, f_, h_), fm(f_, f_, "t2"), fm(h_, h_, "t3"), fm(f_, f_, "%%s%d" % j), fm(h_, h_, "%%s%d" % j),
-                    tz_st(f_, "r14", 32 * j), tz_st(h_, "r14", 128 + 32 * j)]          # (the low nibble's chain in f's register)
+            if "intexp" in qdiag: ops += [wb(f_, x_, bool(j % 2)), vand(h_, f_), isub(f_, f_, h_), tz_st(f_, "r14", 32 * j), tz_st(h_, "r14", 128 + 32 * j)]
+            elif "noint" in qdiag: ops += [wb(f_, x_, bool(j % 2)), fm(h_, f_, "t3"), fm(f_, f_, "t2"), fm(f_, f_, "%%s%d" % j), fm(h_, h_, "%%s%d" % j),
+                                           tz_st(f_, "r14", 32 * j), tz_st(h_, "r14", 128 + 32 * j)]
+            else: ops += [wb(f_, x_, bool(j % 2)), vand(h_, f_), isub(f_, f_, h_), fm(f_, f_, "t2"), fm(h_, h_, "t3"), fm(f_, f_, "%%s%d" % j), fm(h_, h_, "%%s%d" % j),
+                          tz_st(f_, "r14", 32 * j), tz_st(h_, "r14", 128 + 32 * j)]          # (the low nibble's chain in f's register)
         ops += [tz_s("add r13, r13, 256", E.add("r13", "r13", 256), ("r13",), ("r13",)), tz_s("add r3, r3, 128", E.add("r3", "r3", 128), ("r3",), ("r3",)),
                 tz_s("add r14, r14, r7", E.add("r14", "r14", "r7"), ("r14", "r7"), ("r14",))]
         mb, _ = tz_sched(ops, pool=["t%d" % r for r in range(4, 32)])
         assert len(mb) <= 31, ("q4m expand body", len(mb))
+        if os.environ.get("ZHOUYI_Q4M_BODY"): print(f"q4m expand body {qdiag}: {len(mb)} bundles a 128-weight pass", flush=True)
         for p_ in range(4):
             e += add("r13", src, 64 * p_) + add("r14", "r25", 256 * p_) + _mov32("r7", QSV) + [BUNDLE(I("add r3, r25, r7", E.add("r3", "r25", "r7")))]
             e += _mov32("r7", 1024) + [BUNDLE(I("mov r10, %d" % (NB - 1), E.mov("r10", NB - 1))), BUNDLE(I("loop r10", E.loop("r10")))] + mb + [BUNDLE(I("loopend", E.loopend()))]
