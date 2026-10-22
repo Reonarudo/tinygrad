@@ -4914,7 +4914,12 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     skip = 1
     body += [BUNDLE(I("add r29, r7, 0", E.add("r29", "r7", 0)))]  # GSRAM C base, before r7 is scratch
     body += [BUNDLE(I("add r31, r8, 0", E.add("r31", "r8", 0)))] if False else [BUNDLE(I("add r19, r8, 0", E.add("r19", "r8", 0)))]  # group count
-    if bsel: body += [BUNDLE(I("ld r10, [r9+0]", E.ld("r10", "r9", 0))), BUNDLE(I("add r1, r1, r10", E.add("r1", "r1", "r10")))]   # B += the head's slot
+    bskip = None
+    if bsel:                       # B += the head's slot; a slot of -1 (an unused head: a device-built table's tail) ends the task
+        body += [BUNDLE(I("ld r10, [r9+0]", E.ld("r10", "r9", 0))), BUNDLE(I("add r7, r10, 1", E.add("r7", "r10", 1))),
+                 BUNDLE(I("cbnz r7, .Lsel", E.cbnz("r7", 2)))]
+        bskip = len(body); body += [BUNDLE()]                                   # (patched: b .Ldone)
+        body += [BUNDLE(I("add r1, r1, r10", E.add("r1", "r1", "r10")))]
     if stamps: body += [BUNDLE(I("add r28, r9, 0", E.add("r28", "r9", 0))), CYC("r30"), BUNDLE(I("st r30, [r28+0]", E.st("r30", "r28", 0))), BUNDLE(I("mov r20, 0", E.mov("r20", 0))), BUNDLE(I("mov r21, 0", E.mov("r21", 0))), BUNDLE(I("mov r26, 0", E.mov("r26", 0)))]
     if rowmax: body += _mov32("r7", 0xFF800000) + [BUNDLE(I("bcast t31.w, r7", E.bcast("t31", "r7")))]  # t31 = -inf
     body += _lsram_base("r12") + add("r25", "r12", BREG) + add("r9", "r12", A0) + add("r11", "r12", A1) + add("r23", "r3", 0) + add("r24", "r3", 32)
@@ -5068,6 +5073,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                  BUNDLE(I("st r21, [r28+8]", E.st("r21", "r28", 8))), BUNDLE(I("st r26, [r28+12]", E.st("r26", "r28", 12)))]
     if DMA_DRAIN and timing != "dmaonly": body += wait_flags(3)  # last row block's drain
     body[skip] = BUNDLE(I("b .Ldone", E.b(len(body) - skip)))
+    if bskip is not None: body[bskip] = BUNDLE(I("b .Ldone", E.b(len(body) - bskip)))
     return prologue(10 if stamps or bsel else 9) + body + epilogue()
 
 
