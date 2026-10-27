@@ -111,11 +111,14 @@ class RawDevice:
   # buffer ends within 16 B of a page boundary). Measured on the device.
   LOAD_OVERHANG = 16
 
-  def req_buf(self, nbytes: int, data_type: int = MM_REUSE) -> Buffer:
+  def req_buf(self, nbytes: int, data_type: int = MM_REUSE, asid: int = 0) -> Buffer:
+    """`asid` 1..3: the buffer in that ASID's 3 GiB IOVA window (the KMD's custom-IOVA layout: NPU base asid x 4 GiB); its low 32 bits
+    are its offset there, which a DMA with ext_base kGlobal1..3 reaches when the chain head carries the bases (ZHOUYI_ASID_BASES).
+    Plain loads and stores see ASID0 only."""
     # Clamp a zero-byte request once, before both sizes are derived from it.
     nbytes = max(nbytes, 1)
     rq = aipu.AIPU_IOCTL_REQ_BUF(self.fd, align_in_page=1, bytes=mapped_extent(nbytes + self.LOAD_OVERHANG), data_type=data_type,
-                                 asid=0, region=0)
+                                 asid=asid, region=0)
     # Note: when the ASID0 window is exhausted the driver can return rc=0 with an all-zero descriptor
     # (the mmap would then fail with EINVAL). Check the descriptor, not just the return code.
     if rq.desc.bytes == 0 or rq.desc.pa == 0:
@@ -417,7 +420,13 @@ def build_group_tcbs(dev: RawDevice, tcbs: Buffer, groups: list[GroupSlot],
   # [0] grid/INIT: carries the ASID bases and skips over the SegMMU TCBs.
   struct.pack_into("<II", t, 0, (GRID_SEGMMU_COUNT << 16) | 0, task_pa_rel(0))
   struct.pack_into("<I", t, 20, dev.grid_id << 16)
+  # ZHOUYI_ASID_BASES="off1[,off2[,off3]]": the NPU-view bases of ASID 1..3 as offsets from ASID0's (the KMD's custom-IOVA layout puts
+  # ASID n at n x 4 GiB); a DMA whose ext_base is kGlobal1..3 then reaches memory requested in that ASID. Unset: ASID1 = asid1_base
+  # (the AIFF's weight fetches), ASID2 / 3 zero, as before.
+  offs = [int(v, 0) for v in os.environ.get("ZHOUYI_ASID_BASES", "").split(",") if v]
+  if offs: a1 = dev.asid0 + offs[0]
   struct.pack_into("<QQ", t, 48, dev.asid0 | ASID_RD | ASID_WR, a1 | ASID_RD | ASID_WR)
+  for k, off in enumerate(offs[1:], 2): struct.pack_into("<Q", t, 48 + 8 * k, (dev.asid0 + off) | ASID_RD | ASID_WR)
   if gm_pa is not None: gm_fields(t, gm_pa)
   # [1],[2] SegMMU
   for k in (1, 2):

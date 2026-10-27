@@ -125,6 +125,8 @@ DMA_H = r"""
 #define LSH(off) ((__global half*)(LSRAM_BASE + (off)))
 #define DMA_FILL(flag, desc, ls_off, ext)  __builtin_aipu_dma_inter(0, (flag) * 257, 0, 4, 0, 1, 0, (desc), LSRAM_BASE + (ls_off), (ext))
 #define DMA_DRAIN(flag, desc, ls_off, ext) __builtin_aipu_dma_inter(0, (flag) * 257, 0, 4, 0, 0, 0, (desc), LSRAM_BASE + (ls_off), (ext))
+#define DMA_FILLB(flag, desc, ls_off, ext, base)  __builtin_aipu_dma_inter(0, (flag) * 257, 0, 4, (base), 1, 0, (desc), LSRAM_BASE + (ls_off), (ext))
+#define DMA_DRAINB(flag, desc, ls_off, ext, base) __builtin_aipu_dma_inter(0, (flag) * 257, 0, 4, (base), 0, 0, (desc), LSRAM_BASE + (ls_off), (ext))
 #define DMA_WAIT(flag) __builtin_aipu_wfe_inter(~(1 << (flag)), 1)
 #define DMA_WAIT_ALL() __builtin_aipu_wfe_inter(0, 2)
 #define DESC(d, i) ((int)(d) + 64 * (i))
