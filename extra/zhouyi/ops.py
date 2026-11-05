@@ -705,7 +705,9 @@ class AiffGMRunner(Runner):
     self.src = [v[o + e * self.R:o + (e + 1) * self.R] for e in range(3)]    # round r's tile: byte offset in the weights
     self.kicks = [[[] for _ in range(self.R)] for _ in range(3)]
     for e, r, c, *offs in sorted(ch): self.kicks[e][r].append(tuple(offs))
-    assert self.tile % (3 * GM_STAGE_CHUNK) == 0 and 6 * self.tile <= GM_WINDOW, "the slots must fit the GM window"
+    assert self.tile % GM_STAGE_CHUNK == 0 and 6 * self.tile <= GM_WINDOW, "the slots must fit the GM window (a tile of whole stage chunks)"
+    nch = self.tile // GM_STAGE_CHUNK; cnt = [nch // 3 + (1 if k < nch % 3 else 0) for k in range(3)]   # chunks a staging task (equal when 3 divides)
+    self.shares = [(sum(cnt[:k]) * GM_STAGE_CHUNK, cnt[k]) for k in range(3)]   # (byte offset in the tile, chunks)
     assert all(len(k) <= 40 for ke in self.kicks for k in ke)
     self.raw = Device[device].raw
     self.gm_pa, self.gm0 = gm_window(self.raw)
@@ -735,7 +737,7 @@ class AiffGMRunner(Runner):
   def _prepare(self, rawbufs:list[Buffer]):
     w, d = self.raw.dev_addr(rawbufs[2]._buf), self.raw.dev_addr(rawbufs[3]._buf)
     if self._staged_key == (w, d): return
-    ds, share = self.raw.dev_addr(self.dsc), self.tile // 3
+    ds = self.raw.dev_addr(self.dsc)
     for L, lay in enumerate(self.lays):
       for t in range(14):
         words = [0, 0, 0, 0, ds]
@@ -744,9 +746,10 @@ class AiffGMRunner(Runner):
           if k == 0 and L >= 1:
             ks = self.kicks[e][L - 1]; words[0] = len(ks); words += [d + x for c in ks for x in c]
           elif k >= 1 and L < self.R:
-            words[1] = w + self.src[e][L] + (k - 1) * share
-            words[2] = self.gm0 + (2 * e + L % 2) * self.tile + (k - 1) * share
-            words[3] = 0 if os.environ.get("ZHOUYI_AIFF_NOSTAGE") == "1" else share // GM_STAGE_CHUNK   # (a timing arm: no staging, wrong results)
+            o_, n_ = self.shares[k - 1]
+            words[1] = w + self.src[e][L] + o_
+            words[2] = self.gm0 + (2 * e + L % 2) * self.tile + o_
+            words[3] = 0 if os.environ.get("ZHOUYI_AIFF_NOSTAGE") == "1" else n_   # (a timing arm: no staging, wrong results)
         ctypes.memmove(lay.params[t].va, struct.pack("<%dI" % len(words), *words), 4 * len(words))
     self._staged_key = (w, d)
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
