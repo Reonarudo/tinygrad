@@ -653,7 +653,7 @@ class AiffLinRunner(Runner):
 GM_STAGE_CHUNK = 8192             # bytes a stage DMA moves (DDR -> LSRAM -> GM)
 
 
-def k_aiff_gm():
+def k_aiff_gm(nowait=None):
   """`k_aiff_list` + a weight stager, one image (a group's tasks share it). params (`pp`): [0] kick count n (0: none), [1] stage
   source (DDR), [2] stage destination (the GM window), [3] stage chunks of GM_STAGE_CHUNK bytes (0: none), [4] the chunk's DMA
   descriptor, [5..] n triples (ctrl, param, act). The kicks run their chains in order, each to completion; the stage copies its
@@ -661,13 +661,14 @@ def k_aiff_gm():
   from extra.zhouyi import enc as E
   from extra.zhouyi.image import I, BUNDLE, prologue, epilogue
   from extra.zhouyi.kern_tpc import _lsram_base
+  nowait = (os.environ.get("ZHOUYI_AIFF_NOWAIT") == "1") if nowait is None else nowait
   kick = [BUNDLE(I("ld r6, [r5+0]", E.ld("r6", "r5", 0)), I("ld r7, [r5+4]", E.ld("r7", "r5", 4))),
           BUNDLE(I("ld r8, [r5+8]", E.ld("r8", "r5", 8))),
           BUNDLE(I("mov r9, -2", E.mov("r9", -2))),
           BUNDLE(I("add r5, r5, 12", E.add("r5", "r5", 12))),
           BUNDLE(I("sub r0, r0, 1", E.sub("r0", "r0", 1))),
           BUNDLE(I("aiff 0, zero, 0, r6, r7, r8", E.aiff(0, "zero", 0, "r6", "r7", "r8"))),
-          BUNDLE(I("wfe r9, 1", E.wfe("r9", 1)))]
+          BUNDLE(I("wfe r9, 1", E.wfe("r9", 1))) if not nowait else BUNDLE(I("mov r9, 0", E.mov("r9", 0)))]   # ZHOUYI_AIFF_NOWAIT: a timing arm (no wait for the chain; wrong results)
   kick.append(BUNDLE(I("cbnz r0, .Lkick", E.cbnz("r0", -len(kick)))))
   stage = [BUNDLE(I("dma 0, zero, 0, 4, 0, 1, 0, r4, r12, r1", E.dma(E.DMA_DIRECT, "zero", 0, E.DMA_LSRAM, E.DMA_GLOBAL, E.DMA_EXT2INT, E.DMA_USELESS, "r4", "r12", "r1"))),
            BUNDLE(I("sub r10, zero, 2", E.sub("r10", "zero", 2))), BUNDLE(I("wfe r10, 1", E.wfe("r10", 1))),
@@ -705,7 +706,7 @@ class AiffGMRunner(Runner):
   chain_member = True
   chain_cycles = False
   uses_gm = True
-  ENV_KEYS = ('ZHOUYI_AIFF_NOSTAGE',)
+  ENV_KEYS = ('ZHOUYI_AIFF_NOSTAGE', 'ZHOUYI_AIFF_NOWAIT', 'ZHOUYI_AIFF_SPIN')
   def __init__(self, cf:UOp, device:str):
     v = [int(x.arg) for x in cf.src]
     self.R, self.tile, n = v[0], v[1], v[2]
