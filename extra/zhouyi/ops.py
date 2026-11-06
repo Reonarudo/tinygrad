@@ -677,13 +677,21 @@ def k_aiff_gm():
            BUNDLE(I("add r1, r1, r13", E.add("r1", "r1", "r13"))), BUNDLE(I("add r2, r2, r13", E.add("r2", "r2", "r13"))),
            BUNDLE(I("sub r3, r3, 1", E.sub("r3", "r3", 1)))]
   stage.append(BUNDLE(I("cbnz r3, .Lstage", E.cbnz("r3", -len(stage)))))
-  pre_k = [BUNDLE(I("cbnz r0, .Lk0", E.cbnz("r0", 2))), BUNDLE(I("b .Ls0", E.b(0))), BUNDLE(I("add r5, pp, 20", E.add("r5", "pp", 20)))]
-  pre_s = [BUNDLE(I(".Ls0: cbnz r3, .Ls1", E.cbnz("r3", 2))), BUNDLE(I("b .Ldone", E.b(0)))] + _lsram_base("r12") + \
+  pre_k = [BUNDLE(I("cbnz r0, .Lk0", E.cbnz("r0", 2))), BUNDLE(I("b .Ls0", E.b(0))), BUNDLE(I("add r5, pp, 24", E.add("r5", "pp", 24)))]   # the triples from word 6 (word 5: the spin)
+  pre_s = [BUNDLE(I(".Ls0: cbnz r3, .Ls1", E.cbnz("r3", 2))), BUNDLE(I("b .Lspin", E.b(0)))] + _lsram_base("r12") + \
           [BUNDLE(I("mov r13, %d" % GM_STAGE_CHUNK, E.mov("r13", GM_STAGE_CHUNK)))]
-  body = pre_k + kick + pre_s + stage
+  # the spin (a stager task, pp[0] == 0): pp[5] trips of a counted loop after its copies -- ZHOUYI_AIFF_SPIN; the core's
+  # group-to-group turnaround is 65-90 us after an idle group against 6-20 after a busy one (Distributing.md), and the kicker sleeps
+  spin = [BUNDLE(I(".Lspin: ld r14, [pp+20]", E.ld("r14", "pp", 20))), BUNDLE(I("mov r15, 0", E.mov("r15", 0))),
+          BUNDLE(I("mov r15, 0", E.mov("r15", 0))), BUNDLE(I("mov r15, 0", E.mov("r15", 0))),                 # (the load's latency; every task reads word 5)
+          BUNDLE(I("cbnz r14, .Lsp", E.cbnz("r14", 2))), BUNDLE(I("b .Ldone", E.b(0))),
+          BUNDLE(I(".Lsp: sub r14, r14, 1", E.sub("r14", "r14", 1))), BUNDLE(I("cbnz r14, .Lsp", E.cbnz("r14", -1)))]
+  body = pre_k + kick + pre_s + stage + spin
   body[1] = BUNDLE(I("b .Ls0", E.b(len(pre_k) + len(kick) - 1)))
   i = len(pre_k) + len(kick) + 1
-  body[i] = BUNDLE(I("b .Ldone", E.b(len(body) - i)))
+  body[i] = BUNDLE(I("b .Lspin", E.b(len(pre_k) + len(kick) + len(pre_s) + len(stage) - i)))
+  j = len(pre_k) + len(kick) + len(pre_s) + len(stage)                   # .Lspin
+  body[j + 5] = BUNDLE(I("b .Ldone", E.b(len(body) - (j + 5))))
   return prologue(5, fp=False) + body + epilogue()
 
 
@@ -745,7 +753,7 @@ class AiffGMRunner(Runner):
         if 1 <= t <= 12:
           e, k = (t - 1) // 4, (t - 1) % 4
           if k == 0 and L >= 1:
-            ks = self.kicks[e][L - 1]; words[0] = len(ks); words += [d + x for c in ks for x in c]
+            ks = self.kicks[e][L - 1]; words[0] = len(ks); words += [0] + [d + x for c in ks for x in c]   # word 5 (no spin), then the triples
           elif k >= 1 and L < self.R:
             o_, n_ = self.shares[k - 1]
             words[1] = w + self.src[e][L] + o_
@@ -798,9 +806,10 @@ class AiffGM2Runner(AiffGMRunner):
     a, w, d = (self.raw.dev_addr(rawbufs[i]._buf) for i in (1, 2, 3))
     if self._staged_key == (a, w, d): return
     ds = self.raw.dev_addr(self.dsc); w0 = self.gm0 + self.act
+    spin = int(os.environ.get("ZHOUYI_AIFF_SPIN", "0"))
     for L, lay in enumerate(self.lays):
       for t in range(14):
-        words = [0, 0, 0, 0, ds]
+        words = [0, 0, 0, 0, ds, 0]                                      # pp[5]: the spin trips of a task without kicks (0: none) -- always written
         if 1 <= t <= 12:
           e, k = (t - 1) // 4, (t - 1) % 4
           if L == 0:                                                      # the activations into GM, 12 shares
@@ -808,10 +817,12 @@ class AiffGM2Runner(AiffGMRunner):
           else:
             Lw = L - 1                                                    # the parent's launch index
             if k == 0 and Lw >= 1:
-              ks = self.kicks[e][Lw - 1]; words[0] = len(ks); words += [d + x for c in ks for x in c]
-            elif k >= 1 and Lw < self.R:
-              o_, n_ = self.shares[k - 1]
-              words[1] = w + self.src[e][Lw] + o_; words[2] = w0 + (2 * e + Lw % 2) * self.tile + o_; words[3] = n_
+              ks = self.kicks[e][Lw - 1]; words[0] = len(ks); words += [d + x for c in ks for x in c]   # the kick triples from word 6
+            elif k >= 1:
+              words[5] = spin                                             # a stager: spins after its copies
+              if Lw < self.R:
+                o_, n_ = self.shares[k - 1]
+                words[1] = w + self.src[e][Lw] + o_; words[2] = w0 + (2 * e + Lw % 2) * self.tile + o_; words[3] = n_
         ctypes.memmove(lay.params[t].va, struct.pack("<%dI" % len(words), *words), 4 * len(words))
     self._staged_key = (a, w, d)
 
