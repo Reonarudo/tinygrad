@@ -57,6 +57,7 @@ def _install_lowering():
     (UPat(Ops.CUSTOM_FUNCTION, arg=CSRC_ARG, name="cf"), lambda ctx, cf: _csrc_runner(cf, ctx[0].device)),
     (UPat(Ops.CUSTOM_FUNCTION, arg=AIFF_LIN_ARG, name="cf"), lambda ctx, cf: _cached_runner(AiffLinRunner, cf, ctx[0].device)),
     (UPat(Ops.CUSTOM_FUNCTION, arg=AIFF_GM_ARG, name="cf"), lambda ctx, cf: _cached_runner(AiffGMRunner, cf, ctx[0].device)),
+    (UPat(Ops.CUSTOM_FUNCTION, arg=AIFF_GM2_ARG, name="cf"), lambda ctx, cf: _cached_runner(AiffGM2Runner, cf, ctx[0].device)),
   ])
   _LOWERING_INSTALLED = True
 
@@ -759,6 +760,74 @@ class AiffGMRunner(Runner):
     return time.perf_counter() - st if wait else None
 
 
+class AiffGM2Runner(AiffGMRunner):
+  """`AiffGMRunner` with the ACTIVATIONS in GM too (aiff2b stage 2: both operands from GM is 3.4x the DDR-fed rate at K 2048, the
+  weights re-fetched a step at ~19.6 GB/s from GM where three engines would share the 24 GB/s port). GM: [the activation surfaces,
+  `act` bytes][6 weight slots of `tile`]; launch 0 stages the activations (its 12 tasks a share each), launch 1 round 0's weight
+  tiles, launch L >= 2 kicks round L - 2 while staging round L - 1 (as the parent). The descriptors name the activations at the
+  window's start and the slots after them (`aiff2b/desc2b.py --gm`, relocated by the caller). `rawbufs` = (out, a8, w, desc)."""
+  def __init__(self, cf:UOp, device:str):
+    v = [int(x.arg) for x in cf.src]; self.act = v[0]
+    assert self.act % GM_STAGE_CHUNK == 0, "the activation region: whole stage chunks"
+    self.R, self.tile, n = v[1], v[2], v[3]
+    ch = [tuple(v[4 + 6 * i:10 + 6 * i]) for i in range(n)]
+    o = 4 + 6 * n
+    self.src = [v[o + e * self.R:o + (e + 1) * self.R] for e in range(3)]
+    self.kicks = [[[] for _ in range(self.R)] for _ in range(3)]
+    for e, r, c, *offs in sorted(ch): self.kicks[e][r].append(tuple(offs))
+    assert self.tile % GM_STAGE_CHUNK == 0 and self.act + 6 * self.tile <= GM_WINDOW, "the activations and the 6 slots must fit the GM window"
+    nch = self.tile // GM_STAGE_CHUNK; cnt = [nch // 3 + (1 if k < nch % 3 else 0) for k in range(3)]
+    self.shares = [(sum(cnt[:k]) * GM_STAGE_CHUNK, cnt[k]) for k in range(3)]
+    na = self.act // GM_STAGE_CHUNK; ca = [na // 12 + (1 if k < na % 12 else 0) for k in range(12)]
+    self.ashares = [(sum(ca[:k]) * GM_STAGE_CHUNK, ca[k]) for k in range(12)]   # (byte offset, chunks) a task of launch 0
+    assert all(len(k) <= 40 for ke in self.kicks for k in ke)
+    self.raw = Device[device].raw
+    self.gm_pa, self.gm0 = gm_window(self.raw)
+    self.text = _image.text_only(k_aiff_gm())
+    self.dsc = self.raw.req_buf(64, MM_REUSE); ctypes.memmove(self.dsc.va, struct.pack("<6I", *dma.desc_words(GM_STAGE_CHUNK)), 24)
+    self._mk()
+    self._chain_gen = 0
+    self._staged_key = None
+    Runner.__init__(self, f"AIFF int8 linear, both operands in GM ({self.R} rounds x 3 engines, {n} chains)", device)
+  def _mk(self):
+    self.lays = []
+    for _ in range(self.R + 2):
+      lay = Launch(self.raw, self.text, b"", gsram=False, where="ddr")
+      lay.chain([14], group_widths=[1, 4, 4, 4, 1], dep=[0, 0, 0, 0, _dev.DEP_PRE_ALL], gm_pa=self.gm_pa); self.lays.append(lay)
+  def _prepare(self, rawbufs:list[Buffer]):
+    a, w, d = (self.raw.dev_addr(rawbufs[i]._buf) for i in (1, 2, 3))
+    if self._staged_key == (a, w, d): return
+    ds = self.raw.dev_addr(self.dsc); w0 = self.gm0 + self.act
+    for L, lay in enumerate(self.lays):
+      for t in range(14):
+        words = [0, 0, 0, 0, ds]
+        if 1 <= t <= 12:
+          e, k = (t - 1) // 4, (t - 1) % 4
+          if L == 0:                                                      # the activations into GM, 12 shares
+            o_, n_ = self.ashares[t - 1]; words[1] = a + o_; words[2] = self.gm0 + o_; words[3] = n_
+          else:
+            Lw = L - 1                                                    # the parent's launch index
+            if k == 0 and Lw >= 1:
+              ks = self.kicks[e][Lw - 1]; words[0] = len(ks); words += [d + x for c in ks for x in c]
+            elif k >= 1 and Lw < self.R:
+              o_, n_ = self.shares[k - 1]
+              words[1] = w + self.src[e][Lw] + o_; words[2] = w0 + (2 * e + Lw % 2) * self.tile + o_; words[3] = n_
+        ctypes.memmove(lay.params[t].va, struct.pack("<%dI" % len(words), *words), 4 * len(words))
+    self._staged_key = (a, w, d)
+
+
+AIFF_GM2_ARG = "zhouyi_aiff_gm2"
+
+
+def aiff_gm2(out, a8, w, desc, act_bytes:int, rounds:int, tile:int, chains, src):
+  """`aiff_gm` with the activations staged into GM as well (`AiffGM2Runner`): `act_bytes` of `a8` land at the window's start, the
+  weight slots follow; the descriptors must name those addresses."""
+  from tinygrad.tensor import Tensor
+  flat = [act_bytes, rounds, tile, len(chains)] + [int(x) for c in chains for x in c] + [int(x) for se in src for x in se]
+  fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=tuple(UOp.const(dtypes.int, v) for v in flat), arg=AIFF_GM2_ARG)
+  return Tensor(out.uop.after(fn.call(out.uop, a8.uop, w.uop, desc.uop)))
+
+
 AIFF_GM_ARG = "zhouyi_aiff_gm"
 
 
@@ -781,5 +850,5 @@ def aiff_lin(out, a8, w, desc, chains):
   return Tensor(out.uop.after(fn.call(out.uop, a8.uop, w.uop, desc.uop)))
 
 
-CHAIN_MEMBER_ARGS.update({CSRC_ARG, GEMM_GS_ARG, E4M3_STREAM_ARG, AIFF_LIN_ARG, AIFF_GM_ARG})
+CHAIN_MEMBER_ARGS.update({CSRC_ARG, GEMM_GS_ARG, E4M3_STREAM_ARG, AIFF_LIN_ARG, AIFF_GM_ARG, AIFF_GM2_ARG})
 _install_lowering()
