@@ -73,13 +73,14 @@ def gs_scale_bytes(ns: int, ks: int, q8: int = 0, scales: str = "dup", tscale: s
     return ns * (128 if scales == "dup" else 64) if not q8 else ns * 32 if q8 == 1 else ns * 32 * (ks // 8)
 
 
-def code_bytes(q8: int = 0, tern: bool = False) -> int:
-    """B stream bytes a strip k-step (64 weights) of a b8 gemm_gs: 2-bit ternary codes 16, 4-bit Q4_K codes (q8 3) 32, else 64."""
-    return 16 if tern else 32 if q8 in (3, 5) else 64
+def code_bytes(q8: int = 0, tern: bool = False, q4t: bool = False) -> int:
+    """B stream bytes a strip k-step (64 weights) of a b8 gemm_gs: 2-bit ternary codes 16, 4-bit codes (Q4_K q8 3 / 5, q4t) 32, else 64."""
+    return 32 if q4t else 16 if tern else 32 if q8 in (3, 5) else 64
 
 
 def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bscale: bool = False, a_bytes: int | None = None,
-                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False, tscale: str = "f32", c_rt: int | None = None) -> bytes:
+                   prefetch: bool = False, q8: int = 0, scales: str = "dup", tern: bool = False, tscale: str = "f32", c_rt: int | None = None,
+                   q4t: bool = False) -> bytes:
     """+0 the A row-block slice (`a_bytes`, default ks x 96; rows mode: the compact ks x 32 rt), +32 the B group slice (fp16, or
     the E4M3 codes with `b8`), +64 the row block's C drain (`k_gemm_gs(drain="dma")`; + its 192 B of row maxima with `rowmax`),
     +96 the slice's scale table (`bscale`, ns x 128 B, or ns x 64 B with `scales="single"`), +128 (`prefetch`: k_gemm_gs rows
@@ -91,7 +92,7 @@ def descriptors_gs(ks: int, ns: int, rowmax: bool = False, b8: bool = False, bsc
     assert c_rt in (None, 1, 2) and not (c_rt and rowmax), c_rt
     drain = D.desc_words(ns * 768 + (192 if rowmax else 0)) if not c_rt else D.desc_words(ns * 256 * c_rt, width=256 * c_rt, ext_stride=768, int_stride=768)
     ws = [D.desc_words(ks * 96 if a_bytes is None else a_bytes), D.desc_words(ns * ks * (64 if b8 else 128)), drain] + ([D.desc_words(scl)] if bscale else [])
-    if prefetch or bscale: ws.append(D.desc_words(ns * ks * code_bytes(q8, tern) + scl))   # +128: a slice's codes + scales in one request
+    if prefetch or bscale: ws.append(D.desc_words(ns * ks * code_bytes(q8, tern, q4t) + scl))   # +128: a slice's codes + scales in one request
     out = bytearray(32 * len(ws))
     for i, w in enumerate(ws): out[32 * i:32 * i + 24] = np.asarray(w, np.uint32).tobytes()
     return bytes(out)
@@ -161,6 +162,28 @@ def pack_b_group_tern(w: np.ndarray, scale: np.ndarray, group: int, ns: int, ks:
     t = t.reshape(nsl, ns, ks // 2, 2, 4, 16).astype(np.uint16)
     codes = (t[..., 0, :] << 6 | t[..., 1, :] << 4 | t[..., 2, :] << 2 | t[..., 3, :]).astype(np.uint8).reshape(nsl, -1)   # [slice][s q h l]
     sc = np.zeros((16 * ns, nsl), np.float32); sc[:nr] = scale[r0:r0 + nr].astype(np.float32) * np.float32(2.0 ** 18)
+    scv = np.ascontiguousarray(sc.T).reshape(nsl, -1).view(np.uint8)                                   # [slice][s j c] fp32
+    if tscale == "f16": scv = tern_table_f16(scv, ns)
+    return np.ascontiguousarray(np.concatenate([codes, scv], 1)).ravel()
+
+
+def pack_b_group_q4t(u: np.ndarray, scale: np.ndarray, group: int, ns: int, ks: int = 32, tscale: str = "f32") -> np.ndarray:
+    """4-bit g128 B `[N, K]` (uint8 codes u = q + 8 in 0..15, w = (u - 8) x scale; `scale[N, K/128]` per column and 128-slice) ->
+    `k_gemm_gs(b8=True, bscale=True, scales="single", q4t=True, ks=32)`'s stream for strips `group*ns .. +ns`: per K-slice the
+    codes, then ternary's single-layout table with scale x 2^20 (fp32, 64 B a strip; `tscale="f16"`: 16 fp16 a strip, s x 2^17).
+    Codes: per strip and k-step pair 64 B as two 32 B units: unit 0's byte 16 h + 4 n + k (h the k-step of the pair, n / k the
+    tile's column / k lane) holds tile 0's code in bits 3:0 and tile 1's in 7:4; unit 1 tiles 2 / 3. A slice is ns x ks x 32 +
+    the table. Rows past N: code 8 (w = 0), scale 0."""
+    assert tscale in TERN_TSCALES, tscale
+    N, K = u.shape; assert 4 * ks == 128 and K % 128 == 0 and ks % 2 == 0 and scale.shape == (N, K // 128), (u.shape, scale.shape)
+    r0, r1 = 16 * ns * group, 16 * ns * (group + 1); nsl = K // 128; nr = max(0, min(N, r1) - r0)
+    c = np.full((16 * ns, K), 8, np.uint8); c[:nr] = u[r0:r0 + nr].astype(np.uint8)
+    assert c.max(initial=0) <= 15, "4-bit codes only"
+    t = c.reshape(ns, 4, 4, nsl, ks // 2, 2, 4).transpose(3, 0, 4, 5, 1, 2, 6)                      # [slice][s][q][h][j][n][k]
+    t = t.reshape(nsl, ns, ks // 2, 2, 4, 16)                                                       # [slice][s][q][h][j][n k]
+    codes = np.stack([t[..., 0, :] | t[..., 1, :] << 4, t[..., 2, :] | t[..., 3, :] << 4], 3).astype(np.uint8)   # [slice][s][q][unit][h][n k]
+    codes = codes.reshape(nsl, -1)
+    sc = np.zeros((16 * ns, nsl), np.float32); sc[:nr] = scale[r0:r0 + nr].astype(np.float32) * np.float32(2.0 ** 20)
     scv = np.ascontiguousarray(sc.T).reshape(nsl, -1).view(np.uint8)                                   # [slice][s j c] fp32
     if tscale == "f16": scv = tern_table_f16(scv, ns)
     return np.ascontiguousarray(np.concatenate([codes, scv], 1)).ravel()

@@ -3795,7 +3795,7 @@ def k_e4m3_stream2(mode="exact", chunk=E4M3_STREAM2_CHUNK):
 
 def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_rb_stride=None, c_rb_stride=None, rowmax=False, timing=None, b8=False, kw=3, bscale=False,
               rows=None, poison=False, q8=False, q8f=False, scales="dup", tern=False, tkloop="orig", tscale="f32", tkloop2="orig", gkloop="orig",
-              q4f=False, qb=32, bsel=False, q4m=False, qdiag=(), gblock=0):
+              q4f=False, qb=32, bsel=False, q4m=False, qdiag=(), gblock=0, q4t=False):
     """C[rb, s] += A[rb] @ B[s] over K-slices, fp16 in, fp32 out, for `nrb` 12-row blocks and `ns`
     16-column strips: A is reused across the strips instead of re-read per strip.
 
@@ -3901,6 +3901,11 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     assert gkloop in ("orig", "sched", "schedg"), gkloop
     assert tkloop in ("orig", "mmfirst"), tkloop
     assert tkloop2 in ("orig", "m8e5", "m8e4", "m8u", "m8w"), tkloop2
+    # q4t: 4-bit codes u = q + 8 (pack_b_group_q4t: tile 0 | tile 1 << 4 in one 32 B unit, tiles 2 / 3 in the next) with ternary's
+    # table (one scale per column and 128-slice, s x 2^20) -- the ternary fast path's fused expand: lsl 4 / and 0xF0 make 16 u in a
+    # byte, the subnormal 16 u x 2^-24 = u x 2^-20 widened by mul / mulh x 1 (no mixing: no triangle); C = -S' (S' = row sums x
+    # 2^-17 = 8 x 2^-20) + sum A u 2^-20 = sum A q 2^-20. Rows 1-4 (rt 1) on the TF path only.
+    Q4T = bool(q4t); tern = tern or Q4T
     assert tscale in ("f32", "f16") and (tscale == "f32" or tern), tscale
     F16S = tscale == "f16"
     QF = q8f or q4f or q4m                         # the weights built in fp16 by the expand: no per-slice scale pass
@@ -3948,7 +3953,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     # 16-bit lane becomes `((code << 8) asr 1) & 0xBFFF`, the fp16 of code x 2^-8, exact for all 254 non-NaN codes
     # (NaN codes 0x7f / 0xff read as +-1.875). C comes out x 2^-8; the caller's per-channel scale carries 2^8.
     # Row block 0's A request is issued before the expansion so they overlap.
-    BH = ns * ks * (16 if tern else 32 if q4f or q4m else 64 if b8 else 128)   # B bytes a slice from DDR (tern: 2-bit codes, q4f: 4-bit)
+    BH = ns * ks * (32 if Q4T else 16 if tern else 32 if q4f or q4m else 64 if b8 else 128)   # B bytes a slice from DDR (tern: 2-bit codes, q4t / q4f: 4-bit)
     TU = next(u for u in (3, 2, 1) if (BH // 32) % u == 0) if tern else 0   # tern: 32-B code units an expand iteration
     # Diagnostic `timing` (wrong results, timing only): "noc" skips the middle slices' GSRAM C loads/stores;
     # "gs{x}{n}" adds n GSRAM accesses of t31 at r15 per 3-k-step body (x: "l" alternating ld/st, "o" loads, "s" stores).
@@ -3979,6 +3984,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
     CBB = BH + (max(SCLB, 32 * TU) if tern else max(SCLB, 128) if V2 or QS else SCLB)   # the codes + scales buffer: expand_v2's pipeline reads 128 B past the codes (a table under 128 B is padded)
     CB = LS.alloc("bscale: a slice's codes + scales", CBB, vld_tail=True) if bscale else STG1 + CROW
     TF = tern and SINGLE and RT <= 2 and timing in (None, "nodma", "pfnodma", "pfnodma2")
+    assert not Q4T or (TF and RT == 1), "k_gemm_gs(q4t): rows 1-4 (the TF path at rt 1)"
     SPB = (256 if TF else 64) * RT                 # TF: the k-loop's starting offsets (a register a C register) instead of S'
     SPO = LS.alloc("q8 / tern: the A slice's row sums x 2^-17 / 2^-18 (a pair a row tile; TF: the C start offsets; q4m: the sub-block sums)", SPB, vld_tail=True) if SP or q4m else None
     if gblock and LS.limit - (-(-LS.used // 32) * 32) - 64 < CBB + (SPB if q4m else 0): gblock = 0   # (the second codes buffer does not fit: the plain order)
@@ -4183,7 +4189,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         return e + body + [BUNDLE(I("loopend", E.loopend()))]
 
     def sprep(half_reg):           # q8: S'_i = the A slice's row sums x 2^-17 per row tile i (mml / mma against a constant tile) -> scratch
-        c = _mov32("r7", 0x00400040 if tern else 0x00800080) + [BUNDLE(I("bcast t30.w, r7", E.bcast("t30", "r7")))]      # fp16 2^-17 (bits 0x0080; tern 2^-18, 0x0040) in every half
+        c = _mov32("r7", 0x00400040 if tern and not Q4T else 0x00800080) + [BUNDLE(I("bcast t30.w, r7", E.bcast("t30", "r7")))]      # fp16 2^-17 (bits 0x0080; tern 2^-18, 0x0040; q4t 2^-17 = 8 x 2^-20) in every half
         c += add("r13", half_reg, 0)
         AR = ["t26", "t27", "t28"]
         for k in range(ks):
@@ -4196,7 +4202,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         c += _mov32("r7", SPO) + [BUNDLE(I("add r7, r25, r7", E.add("r7", "r25", "r7")))]
         if TF:                     # the C start offsets O_j = K_j S' (K = -85/64, -21/16, -5/4, -1): after the k-loop the triangle
             # C(j) - C(j + 1) / 4 then carries O_j - O_(j+1) / 4 = -S' (O_3 = -S'), so the epilogue has no subtract; [i][j][h] at 32 t
-            for j, kv in enumerate((-85 / 64, -21 / 16, -5 / 4, -1.0)):
+            for j, kv in enumerate((-1.0, -1.0, -1.0, -1.0) if Q4T else (-85 / 64, -21 / 16, -5 / 4, -1.0)):   # q4t: no mixing, O_j = -S'
                 c += _mov32("r10", struct.unpack("<I", struct.pack("<f", kv))[0]) + [BUNDLE(I("bcast t%d.w, r10" % (20 + j), E.bcast("t%d" % (20 + j), "r10")))]
             for i in range(RT):
                 for j in range(4):
@@ -4608,8 +4614,9 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
               tz_s("mov r8, %d" % BH, E.mov("r8", BH), (), ("r8",)), tz_s("add r30, %s, r8" % scl, E.add("r30", scl, "r8"), (scl, "r8"), ("r30",)),
               tz_s("mov r10, %d" % stg, E.mov("r10", stg), (), ("r10",)), tz_s("add r3, r25, r10", E.add("r3", "r25", "r10"), ("r25", "r10"), ("r3",)),
               tz_s("mov r12, %d" % SPO, E.mov("r12", SPO), (), ("r12",)), tz_s("add r14, r25, r12", E.add("r14", "r25", "r12"), ("r25", "r12"), ("r14",)),
-              tz_s("mov r7, 0", E.mov("r7", 0), (), ("r7",)), tz_s("movh r7, %d" % (0xBE80 - 0x10000), E.movh("r7", 0xBE80 - 0x10000), ("r7",), ("r7",)),
-              tz_op(lambda m: [("bcast t31.w, r7", E.bcast("t31", "r7"))], ("r7",), ("t31",), 2)]   # -0.25 (t31: the k-loop leaves it alone at rt <= 2)
+              tz_s("mov r7, %d" % (0xF0F0 - 0x10000 if Q4T else 0), E.mov("r7", 0xF0F0 - 0x10000 if Q4T else 0), (), ("r7",)),
+              tz_s("movh r7, %d" % ((0xF0F0 if Q4T else 0xBE80) - 0x10000), E.movh("r7", (0xF0F0 if Q4T else 0xBE80) - 0x10000), ("r7",), ("r7",)),
+              tz_op(lambda m: [("bcast t31.w, r7", E.bcast("t31", "r7"))], ("r7",), ("t31",), 2)]   # -0.25 (t31: the k-loop leaves it alone at rt <= 2); q4t: the 0xF0 byte mask
         if F16S:                   # fp16 2^3 pairs in r12 (after its use for r14): the f16 table's widening constant, bcast per strip.
             # r7 does not survive blk (it is ifz's test register); r12 does, from blk to the drain
             bo += [tz_s("mov r12, %d" % (0x4800), E.mov("r12", 0x4800), (), ("r12",)), tz_s("movh r12, %d" % (0x4800), E.movh("r12", 0x4800), ("r12",), ("r12",))]
@@ -4623,7 +4630,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
         # one pair ahead. rt 1: two B sets (t8-15 / t16-23), A t24 / t25 (k-step a / b), X t26, Y t27 / t28, 1 t29, 0 t30.
         # rt 2: ONE B set t16-23, each tile rewritten right after its two mma bundles (the next pair's), A t24-27 (row tile 0 / 1 of
         # k-step a, then of b), Y t28 / t29 (the code is loaded into t28), 1 t30. t31 (-0.25) is left alone at both.
-        TONE = "t29" if RT == 1 else "t30"
+        TONE = "t30" if Q4T else "t29" if RT == 1 else "t30"
         def k_mma(c, a, b_): return I("mma t%d.fp32, t%d.fp32, %s.fp16, %s.fp16" % (c, c + 1, a, b_), E.mma("t%d" % c, a, b_))
         def k_mul(d, y, hi): return I("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", d, y, TONE), E.vmulb(d, y, TONE, ua=True, high=hi))
         def k_lsl(d, a): return I("lsl %s.b, %s.b, 2" % (d, a), E.vlsli(d, a, 2, size="b"))
@@ -4669,8 +4676,36 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                             KB(k_lsln(y3, X, 6), k_mul(nxt["a"][1], y1, False), k_mul(nxt["b"][1], y1, True)),
                             KB(k_mul(nxt["a"][2], y2, False), k_mul(nxt["b"][2], y2, True), k_ld(X, "r13", 0 if p == 0 else 32)),
                             KB(k_mul(nxt["a"][3], y3, False), k_mul(nxt["b"][3], y3, True))]
-            kb = part(0) + part(1)
-            ent = {"S": S_[0], "A": [(Aa, 0)], "X": X}
+            if Q4T:
+                # q4t: a pair's codes are two 32 B units X0 (tile 0 | tile 1 << 4) and X1 (tiles 2 / 3), 64 B a pair. The next pair's
+                # tiles: Y = X0 << 4 (bytes: 16 u_0), Z = X0 & 0xF0 (16 u_1), then the same from X1 for tiles 2 / 3, each widened by
+                # mul / mulh x 1 (k-step a / b). Per pair 4 mma bundles with the two shifts / ands and the X0'' load beside them,
+                # then four 1-cycle bundles of widens (two a bundle) with the second shift / and, the X1'' load and the pointer add:
+                #   M0 {mma a0, a1 ; ld Ab ; lsl Y = X0 << 4}  M1 {mma a2, a3 ; and Z = X0 & m}  M2 {mma b0, b1 ; ld Aa'}  M3 {mma b2, b3 ; ld X0''}
+                #   E0 {mul a0', mulh b0' (Y) ; lsl Y = X1 << 4}  E1 {mul a1', mulh b1' (Z) ; and Z = X1 & m ; ld X1''}
+                #   E2 {mul a2', mulh b2' (Y) ; add r13 / r8}  E3 {mul a3', mulh b3' (Z)}
+                # (a bundle's reads come first: Y / Z are read by the widens in the bundle that rewrites them). Every nxt tile is
+                # rewritten >= 4 bundles after its last mma read and read >= 2 cycles after its rewrite; X0'' loads after M1 (X0's
+                # last read) and >= 3 cycles before the next M0, X1'' after E1 and 7 bundles before its next read.
+                # X0 t26, X1 t27, Y t28, Z t29, ones t30, mask t31. r13 walks the pairs (128 B a part pair).
+                X0, X1, Y, Z, MSK = "t26", "t27", "t28", "t29", "t31"
+                def k_lsl4(d, a): return I("lsl %s.b, %s.b, 4" % (d, a), E.vlsli(d, a, 4, size="b"))
+                def k_and(d, a): return I("and %s.w, %s.w, %s.w" % (d, a, MSK), E.vand(d, a, MSK))
+                def part(p):
+                    cur, nxt = S_[p], S_[1 - p]; oA = 2 * AST * p; ox = 128 if p == 0 else 64   # p 0: pair 2 at r13 + 128 before the add; p 1: pair 3 at r13 + 64 after it
+                    return [KB(k_mma(0, Aa, cur["a"][0]), k_mma(2, Aa, cur["a"][1]), k_ld(Ab, "r8", oA + AST), k_lsl4(Y, X0)),
+                            KB(k_mma(4, Aa, cur["a"][2]), k_mma(6, Aa, cur["a"][3]), k_and(Z, X0)),
+                            KB(k_mma(0, Ab, cur["b"][0]), k_mma(2, Ab, cur["b"][1]), k_ld(Aa, "r8", oA + 2 * AST)),
+                            KB(k_mma(4, Ab, cur["b"][2]), k_mma(6, Ab, cur["b"][3]), k_ld(X0, "r13", ox)),
+                            KB(k_mul(nxt["a"][0], Y, False), k_mul(nxt["b"][0], Y, True), k_lsl4(Y, X1)),
+                            KB(k_mul(nxt["a"][1], Z, False), k_mul(nxt["b"][1], Z, True), k_and(Z, X1), k_ld(X1, "r13", ox + 32)),
+                            KB(k_mul(nxt["a"][2], Y, False), k_mul(nxt["b"][2], Y, True), k_add("r13", 128) if p == 0 else k_add("r8", 4 * AST)),
+                            KB(k_mul(nxt["a"][3], Z, False), k_mul(nxt["b"][3], Z, True))]
+                kb = part(0) + part(1)
+                ent = {"S": S_[0], "A": [(Aa, 0)], "X": X0}
+            else:
+                kb = part(0) + part(1)
+                ent = {"S": S_[0], "A": [(Aa, 0)], "X": X}
         else:
             S1 = sets(16); A0a, A1a, A0b, A1b, ya, yb = "t24", "t25", "t26", "t27", "t28", "t29"
             def Ma(j): return [k_mma(2 * j, A0a, S1["a"][j]), k_mma(2 * (4 + j), A1a, S1["a"][j])]
@@ -4778,7 +4813,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
             # loop; strip s + 1's are scheduled into strip s's epilogue.
             po = [tz_s("add r8, %s, 0" % half_reg, E.add("r8", half_reg, 0), (half_reg,), ("r8",))]
             po += [tz_ld(r, "r8", o) for r, o in ent["A"]]
-            po += [tz_op(lambda m, d=d, v=v: [("mov4 %s, %d" % (d, v), E.mov4(d, v))], (), (d,), 2) for d, v in ((TONE, 1),) + ((("t30", 0),) if RT == 1 else ())]
+            po += [tz_op(lambda m, d=d, v=v: [("mov4 %s, %d" % (d, v), E.mov4(d, v))], (), (d,), 2) for d, v in ((TONE, 1),) + ((("t30", 0),) if RT == 1 and not Q4T else ())]
             if W:              # m8w: Y_j = Y_0 << 2j from the code in t30; Y_1 / Y_3 in t29 (Y_3 stays: the loop's P0 makes b3 from it), Y_2 in t28
                 for j, y in enumerate(("t30", "t29", "t28", "t29")):
                     if j == 0: po.append(tz_ld(y, "r13", 0))
@@ -4787,6 +4822,18 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                         po.append(tz_op(lambda m, y=y, hi=hi, d=d: [("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", d, y, TONE), E.vmulb(d, y, TONE, ua=True, high=hi))],
                                         (y, TONE), (d,), 2))
                 po.append(tz_ld(ent["X"], "r13", 32))
+                return po + [tz_s("mov r10, %d" % (KX * ks // kw - 1), E.mov("r10", KX * ks // kw - 1), (), ("r10",))] + [tz_ld("t%d" % t, "r14", 32 * t) for t in range(NC)]
+            if Q4T:                # pair 0: X0 / X1 at r13 + 0 / 32 -> Y / Z -> the tiles; pair 1's units into X0 / X1 (r13 + 64 / 96); the mask is bo's t31
+                X0, X1, Y, Z = "t26", "t27", "t28", "t29"
+                po += [tz_ld(X0, "r13", 0), tz_ld(X1, "r13", 32)]
+                for j, (src, lo) in enumerate(((X0, True), (X0, False), (X1, True), (X1, False))):
+                    y = Y if lo else Z
+                    if lo: po.append(tz_op(lambda m, y=y, src=src: [("lsl %s.b, %s.b, 4" % (y, src), E.vlsli(y, src, 4, size="b"))], (src,), (y,), 2))
+                    else: po.append(tz_op(lambda m, y=y, src=src: [("and %s.w, %s.w, t31.w" % (y, src), E.vand(y, src, "t31"))], (src, "t31"), (y,), 2))
+                    for hi, d in ((False, ent["S"]["a"][j]), (True, ent["S"]["b"][j])):
+                        po.append(tz_op(lambda m, y=y, hi=hi, d=d: [("%s %s.h, %s.ub, %s.b, p7.b" % ("mulh" if hi else "mul", d, y, TONE), E.vmulb(d, y, TONE, ua=True, high=hi))],
+                                        (y, TONE), (d,), 2))
+                po += [tz_ld(X0, "r13", 64), tz_ld(X1, "r13", 96)]
                 return po + [tz_s("mov r10, %d" % (KX * ks // kw - 1), E.mov("r10", KX * ks // kw - 1), (), ("r10",))] + [tz_ld("t%d" % t, "r14", 32 * t) for t in range(NC)]
             ys = [("t27", "t28") if RT == 1 else ("t28", "t29") if U else ("t27", "t29")][0] * 2     # Y_0 .. Y_3 alternating (fixed: no virtual among the entry state; m8u: t27 is A1b, t28 the code loaded after)
             po.append(tz_ld(ys[0], "r13", 0))
@@ -4819,7 +4866,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                 for j in range(4):     # (-S' rides in the k-loop's starting offsets), x the column scale, + the previous slices'
                     for h in (0, 1):   # accumulator, store
                         t = 2 * (4 * i + j) + h; x = "t%d" % t
-                        if j < 3: eo.append(tz_f("fma", x, "t%d" % (t + 2), QM))
+                        if j < 3 and not Q4T: eo.append(tz_f("fma", x, "t%d" % (t + 2), QM))
                         if v in ("M", "L"): eo += [tz_ld("%%A%d" % t, "r15", 32 * t), tz_f("fma", "%%A%d" % t, x, SC[j])]; x = "%%A%d" % t   # acc += C x s, fused
                         else: eo.append(tz_f("mul", x, x, SC[j]))
                         eo.append(tz_st(x, "r3" if v in ("L", "FL") else "r15", 32 * t))

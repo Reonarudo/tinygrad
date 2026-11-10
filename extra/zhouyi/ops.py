@@ -134,9 +134,11 @@ class GemmGSRunner(Runner):
     # ternary g128 (`gemm_gs(tern=True)`, src[21]): `gemm_fp16.pack_b_group_tern`'s stream (2-bit codes + the single-layout table)
     # the marker also names the scale table's format -- 1 the single-layout fp32 table, 2 fp16 (`gemm_gs(tscale="f16")`)
     self.tern = int(cf.src[21].arg) if len(cf.src) > 21 else 0
-    assert self.tern in (0, 1, 2), self.tern
-    self.tscale = "f16" if self.tern == 2 else "f32"
+    assert self.tern in (0, 1, 2, 3, 4), self.tern
+    self.q4t = self.tern in (3, 4); self.tscale = "f16" if self.tern in (2, 4) else "f32"   # 3 / 4: q4t (4-bit codes, ternary's table), f32 / f16 table
+    if self.q4t: self.tern = 0
     assert not self.tern or (self.bscale and not self.q8 and self.scales == "single" and self.ks == 32), "gemm_gs(tern): bscale, scales='single', ks 32"
+    assert not self.q4t or (self.bscale and not self.q8 and self.scales == "single" and self.ks == 32 and 1 <= self.rows <= 4), "gemm_gs(q4t): bscale, scales='single', ks 32, rows 1-4"
     # bsel (`gemm_gs(bsel=)`, src[22]): head h's B is offset by the 32-bit word at slot h of a fourth buffer (k_gemm_gs(bsel)): the
     # experts a router picked, without re-staging the launch
     self.bsel = int(cf.src[22].arg) if len(cf.src) > 22 else 0
@@ -173,7 +175,7 @@ class GemmGSRunner(Runner):
       assert not self.b8 or drain == "dma"
       self.text = _image.text_only(_KT.k_gemm_gs(self.ks, self.ns, self.nrbh, c_stride=self.gstride, drain=drain, rowmax=bool(self.rowmax), b8=bool(self.b8), kw=4 if self.bscale or self.ks % 3 else 3, bscale=bool(self.bscale),
                                                    rows=self.rows or None, timing=(os.environ.get("ZHOUYI_GEMM_TIMING") or None) if self.rows else None, bsel=bool(self.bsel), gblock=self.gb_max if self.gblock else 0, qdiag=tuple(x for x in os.environ.get("ZHOUYI_GEMM_QDIAG", "").split(",") if x),
-                                                   q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, q4m=self.q8 == 5, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern),
+                                                   q8=self.q8 == 1, q8f=self.q8 in (2, 4), q4f=self.q8 == 3, q4m=self.q8 == 5, qb=16 if self.q8 == 4 else 32, scales=self.scales, tern=bool(self.tern), q4t=self.q4t,
                                                    tkloop=os.environ.get("ZHOUYI_TERN_KLOOP", "mmfirst"), tscale=self.tscale,   # the rt-1 ternary k-loop order
                                                    tkloop2=os.environ.get("ZHOUYI_TERN_KLOOP2", "m8w"),   # the rt-2 (rows 5-8) k-loop order (orig = the old one)
                                                    # the Q8_0 (q8 1) rows-mode strip loop and expand, scheduled (orig = the old order)
@@ -184,7 +186,7 @@ class GemmGSRunner(Runner):
       rt = -(-self.rows // 4) if self.rows else 0
       self.c_rt = rt if 1 <= rt <= 2 and os.environ.get("ZHOUYI_GEMM_CDRAIN", "live") != "full" else None
       desc = _G.descriptors_gs(self.ks, self.ns, bool(self.rowmax), bool(self.b8), bool(self.bscale), a_bytes=self.ks * 32 * -(-self.rows // 4) if self.rows else None,
-                               prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern), tscale=self.tscale, c_rt=self.c_rt)
+                               prefetch=pf_ok, q8=self.q8, scales=self.scales, tern=bool(self.tern), tscale=self.tscale, c_rt=self.c_rt, q4t=self.q4t)
     self.desc = self.raw.req_buf(len(desc), MM_REUSE); ctypes.memmove(self.desc.va, desc, len(desc))
     # Plan: (head, piece, g0, ng) per task. Groups are split into r runs, with r chosen so tasks fill 12-task
     # launches with the least idle work (each launch waits for its slowest task).
@@ -526,7 +528,7 @@ def e4m3_stream(src, out=None):
   return Tensor(out.uop.after(fn.call(out.uop, src.uop)))
 
 
-def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:int=1, a_stride:int=0, b_stride:int=0, c_stride:int=0, a_off:int=0, b_off:int=0, c_off:int=0, piece:int=0, lin48:bool=False, rowmax:bool=False, b8:bool=False, b_head_div:int=1, bscale:bool=False, rows:int=0, q8:int=0, scales:str="dup", tern:bool=False, tscale:str="f32", bsel=None, out=None):
+def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:int=1, a_stride:int=0, b_stride:int=0, c_stride:int=0, a_off:int=0, b_off:int=0, c_off:int=0, piece:int=0, lin48:bool=False, rowmax:bool=False, b8:bool=False, b_head_div:int=1, bscale:bool=False, rows:int=0, q8:int=0, scales:str="dup", tern:bool=False, q4t:bool=False, tscale:str="f32", bsel=None, out=None):
   """`C = A @ B^T` on the TEC matrix unit (`GemmGSRunner`); returns the fp32 C tiles.
 
     a: A layout (uint16 halves, `vec_f16` / `gemm_fp16.pack_a_slices`: 12*nrb rows x 4*ks*nslices).
@@ -564,8 +566,9 @@ def gemm_gs(a, b, *, ks:int, ns:int, nrb:int, nslices:int, ngroups:int, heads:in
   a = a.contiguous(); b = b.contiguous()
   if out is None: out = Tensor.empty(heads * ngroups * nrb * (ns * 192 + (48 if rowmax else 0)), device=a.device, dtype=dtypes.float32)
   assert scales in ("dup", "single"), scales
-  assert tscale in ("f32", "f16") and (tscale == "f32" or tern), tscale
-  fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=tuple(UOp.const(dtypes.int, int(v)) for v in (ks, ns, nrb, nslices, ngroups, heads, 2 * a_stride, (1 if b8 else 2) * b_stride, 4 * c_stride, 2 * a_off, (1 if b8 else 2) * b_off, 4 * c_off, piece, int(lin48), int(rowmax), int(b8), int(b_head_div), int(bscale), int(rows), int(q8), int(scales == "single"), (2 if tscale == "f16" else 1) if tern else 0, int(bsel is not None))), arg=GEMM_GS_ARG)
+  assert tscale in ("f32", "f16") and (tscale == "f32" or tern or q4t), tscale
+  assert not (tern and q4t), "gemm_gs: tern or q4t"
+  fn = UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=tuple(UOp.const(dtypes.int, int(v)) for v in (ks, ns, nrb, nslices, ngroups, heads, 2 * a_stride, (1 if b8 else 2) * b_stride, 4 * c_stride, 2 * a_off, (1 if b8 else 2) * b_off, 4 * c_off, piece, int(lin48), int(rowmax), int(b8), int(b_head_div), int(bscale), int(rows), int(q8), int(scales == "single"), ((4 if tscale == "f16" else 3) if q4t else (2 if tscale == "f16" else 1)) if (tern or q4t) else 0, int(bsel is not None))), arg=GEMM_GS_ARG)
   return Tensor(out.uop.after(fn.call(out.uop, a.uop, b.uop, *([bsel.contiguous().uop] if bsel is not None else []))))
 
 
