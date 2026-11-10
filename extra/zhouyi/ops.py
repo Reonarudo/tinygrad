@@ -243,7 +243,7 @@ class GemmGSRunner(Runner):
     # the C partials' base per task: with text in GM (ZHOUYI_TEXT_GM, default 1: jobs run GM on, GSRAM is empty) the GM window's C
     # region of the task (64 KiB; a TEC's vld / vst there costs what GSRAM's does, GM.md §6), else its TEC's 64 KiB of GSRAM
     cbase = lambda t: _textgm.gemm_c_base(self.raw, t)
-    bpk = _gfp.code_bytes(self.q8, bool(self.tern)) if self.b8 else 128  # B bytes per strip k-step (2-bit / 4-bit / 8-bit codes / fp16)
+    bpk = _gfp.code_bytes(self.q8, bool(self.tern), self.q4t) if self.b8 else 128  # B bytes per strip k-step (2-bit / 4-bit / 8-bit codes / fp16)
     gb = self.nslices * (self.ns * self.ks * bpk + (_gfp.gs_scale_bytes(self.ns, self.ks, self.q8, self.scales, self.tscale) if self.bscale else 0))  # bytes per B group (+ the scale tables)
     for li, lay in enumerate(self.launches):
       for t in range(13):
