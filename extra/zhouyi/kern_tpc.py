@@ -4683,7 +4683,7 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                 # then four 1-cycle bundles of widens (two a bundle) with the second shift / and, the X1'' load and the pointer add:
                 #   M0 {mma a0, a1 ; ld Ab ; lsl Y = X0 << 4}  M1 {mma a2, a3 ; and Z = X0 & m}  M2 {mma b0, b1 ; ld Aa'}  M3 {mma b2, b3 ; ld X0''}
                 #   E0 {mul a0', mulh b0' (Y) ; lsl Y = X1 << 4}  E1 {mul a1', mulh b1' (Z) ; and Z = X1 & m ; ld X1''}
-                #   E2 {mul a2', mulh b2' (Y) ; add r13 / r8}  E3 {mul a3', mulh b3' (Z)}
+                #   E2 {mul a2', mulh b2' (Y)}  E3 {mul a3', mulh b3' (Z)}; after the second pair {add r8 ; add r13}
                 # (a bundle's reads come first: Y / Z are read by the widens in the bundle that rewrites them). Every nxt tile is
                 # rewritten >= 4 bundles after its last mma read and read >= 2 cycles after its rewrite; X0'' loads after M1 (X0's
                 # last read) and >= 3 cycles before the next M0, X1'' after E1 and 7 bundles before its next read.
@@ -4692,16 +4692,16 @@ def k_gemm_gs(ks=24, ns=6, nrb=14, stamps=False, c_stride=None, drain="tec", a_r
                 def k_lsl4(d, a): return I("lsl %s.b, %s.b, 4" % (d, a), E.vlsli(d, a, 4, size="b"))
                 def k_and(d, a): return I("and %s.w, %s.w, %s.w" % (d, a, MSK), E.vand(d, a, MSK))
                 def part(p):
-                    cur, nxt = S_[p], S_[1 - p]; oA = 2 * AST * p; ox = 128 if p == 0 else 64   # p 0: pair 2 at r13 + 128 before the add; p 1: pair 3 at r13 + 64 after it
+                    cur, nxt = S_[p], S_[1 - p]; oA = 2 * AST * p; ox = 128 + 64 * p   # pair 2 / 3 at r13 + 128 / 192 (the pointer adds follow the second pair)
                     return [KB(k_mma(0, Aa, cur["a"][0]), k_mma(2, Aa, cur["a"][1]), k_ld(Ab, "r8", oA + AST), k_lsl4(Y, X0)),
                             KB(k_mma(4, Aa, cur["a"][2]), k_mma(6, Aa, cur["a"][3]), k_and(Z, X0)),
                             KB(k_mma(0, Ab, cur["b"][0]), k_mma(2, Ab, cur["b"][1]), k_ld(Aa, "r8", oA + 2 * AST)),
                             KB(k_mma(4, Ab, cur["b"][2]), k_mma(6, Ab, cur["b"][3]), k_ld(X0, "r13", ox)),
                             KB(k_mul(nxt["a"][0], Y, False), k_mul(nxt["b"][0], Y, True), k_lsl4(Y, X1)),
                             KB(k_mul(nxt["a"][1], Z, False), k_mul(nxt["b"][1], Z, True), k_and(Z, X1), k_ld(X1, "r13", ox + 32)),
-                            KB(k_mul(nxt["a"][2], Y, False), k_mul(nxt["b"][2], Y, True), k_add("r13", 128) if p == 0 else k_add("r8", 4 * AST)),
+                            KB(k_mul(nxt["a"][2], Y, False), k_mul(nxt["b"][2], Y, True)),
                             KB(k_mul(nxt["a"][3], Z, False), k_mul(nxt["b"][3], Z, True))]
-                kb = part(0) + part(1)
+                kb = part(0) + part(1) + [KB(k_add("r8", 4 * AST), k_add("r13", 128))]   # (scalar adds take slots 0 / 1: a bundle of their own)
                 ent = {"S": S_[0], "A": [(Aa, 0)], "X": X0}
             else:
                 kb = part(0) + part(1)
